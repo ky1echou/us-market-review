@@ -1,0 +1,201 @@
+# us-market-review 默认配置
+# 所有字段均可直接编辑；无需维护 JSON。
+
+app:
+  timezone: Asia/Shanghai
+  output_dir: reports
+  report_language: zh-CN
+
+market:
+  # yfinance history 参数。MVP 使用日线，足够计算 MA5/MA20/RSI14。
+  period: 90d
+  interval: 1d
+
+  benchmarks:
+    - ticker: ^GSPC
+      name: 标普500
+    - ticker: ^IXIC
+      name: 纳斯达克综合
+    - ticker: ^DJI
+      name: 道琼斯工业
+    - ticker: ^RUT
+      name: 罗素2000
+
+  sector_etfs:
+    - ticker: XLK
+      name: 科技
+    - ticker: XLC
+      name: 通信服务
+    - ticker: XLY
+      name: 可选消费
+    - ticker: XLF
+      name: 金融
+    - ticker: XLV
+      name: 医疗保健
+    - ticker: XLI
+      name: 工业
+    - ticker: XLE
+      name: 能源
+    - ticker: XLB
+      name: 材料
+    - ticker: XLP
+      name: 必需消费
+    - ticker: XLU
+      name: 公用事业
+    - ticker: XLRE
+      name: 房地产
+    - ticker: SMH
+      name: 半导体
+    - ticker: SOXX
+      name: 半导体
+    - ticker: ARKK
+      name: 创新成长
+    - ticker: KWEB
+      name: 中概互联网
+
+  key_stocks:
+    - ticker: AAPL
+      name: 苹果
+      theme: 科技龙头
+    - ticker: MSFT
+      name: 微软
+      theme: AI软件
+    - ticker: NVDA
+      name: 英伟达
+      theme: AI算力
+    - ticker: GOOGL
+      name: Alphabet
+      theme: AI应用
+    - ticker: AMZN
+      name: 亚马逊
+      theme: 云计算/消费
+    - ticker: META
+      name: Meta
+      theme: AI广告
+    - ticker: TSLA
+      name: 特斯拉
+      theme: 电动车/机器人
+    - ticker: AVGO
+      name: 博通
+      theme: AI网络
+    - ticker: AMD
+      name: AMD
+      theme: AI芯片
+    - ticker: NFLX
+      name: 奈飞
+      theme: 流媒体
+
+  macro_assets:
+    - ticker: ^TNX
+      name: 美国10年期国债收益率
+    - ticker: TLT
+      name: 20年期以上美债ETF
+    - ticker: IEF
+      name: 7-10年期美债ETF
+    - ticker: UUP
+      name: 美元指数ETF
+    - ticker: GLD
+      name: 黄金ETF
+    - ticker: USO
+      name: 原油ETF
+    - ticker: CPER
+      name: 铜ETF
+    - ticker: BTC-USD
+      name: 比特币
+
+news:
+  lookback_hours: 36
+  max_items_per_feed: 20
+  request_timeout_sec: 15
+  user_agent: us-market-review/0.1
+  feeds:
+    - name: Yahoo Finance
+      url: https://finance.yahoo.com/news/rssindex
+    - name: CNBC Markets
+      url: https://www.cnbc.com/id/100003114/device/rss/rss.html
+    - name: CNBC Economy
+      url: https://www.cnbc.com/id/20910258/device/rss/rss.html
+    - name: MarketWatch Top Stories
+      url: https://feeds.content.dowjones.io/public/rss/mw_topstories
+    - name: Nasdaq Markets
+      url: https://www.nasdaq.com/feed/rssoutbound?category=Markets
+
+themes:
+  ai_keywords:
+    - AI
+    - artificial intelligence
+    - Nvidia
+    - GPU
+    - semiconductor
+    - data center
+    - cloud
+    - inference
+    - OpenAI
+    - Microsoft
+    - Meta
+    - Amazon
+    - Alphabet
+  macro_keywords:
+    - Fed
+    - inflation
+    - CPI
+    - PCE
+    - payroll
+    - Treasury
+    - yield
+    - dollar
+    - tariff
+    - oil
+    - geopolitical
+  china_keywords:
+    - China
+    - Hong Kong
+    - ADR
+    - Alibaba
+    - Tencent
+    - JD.com
+    - PDD
+    - Baidu
+    - EV
+
+ah_mapping:
+  - us_ticker: NVDA
+    us_name: 英伟达
+    theme: AI算力
+    a_h_mapping: 光模块、PCB、服务器、液冷、算力租赁、半导体设备
+    watch_points: 关注美股AI芯片与半导体ETF对A股算力链情绪映射
+  - us_ticker: AMD
+    us_name: AMD
+    theme: AI芯片
+    a_h_mapping: GPU产业链、先进封装、服务器
+    watch_points: 关注AI芯片竞争格局和数据中心需求
+  - us_ticker: AVGO
+    us_name: 博通
+    theme: AI网络/ASIC
+    a_h_mapping: 交换机、光通信、ASIC、PCB
+    watch_points: 关注AI网络和定制芯片需求
+  - us_ticker: MSFT
+    us_name: 微软
+    theme: 云与AI应用
+    a_h_mapping: 云计算、软件、AI应用、数据中心
+    watch_points: 关注云资本开支和AI商业化
+  - us_ticker: TSLA
+    us_name: 特斯拉
+    theme: 电动车/机器人
+    a_h_mapping: 汽车零部件、机器人、智能驾驶、锂电
+    watch_points: 关注交付、价格、FSD与机器人催化
+  - us_ticker: KWEB
+    us_name: 中概互联网ETF
+    theme: 中概/港股互联网
+    a_h_mapping: 港股互联网、平台经济、恒生科技
+    watch_points: 关注中概风险偏好对港股和A股互联网映射
+
+report:
+  title: 中文美股复盘报告
+  author: us-market-review
+  top_movers_count: 5
+  include_raw_audit_section: true
+  pdf:
+    enabled: true
+    font_path: ""
+
