@@ -14,7 +14,7 @@ jobs:
         run: |
           echo "Deploying commit: ${GITHUB_SHA}"
 
-      - name: Deploy over SSH
+      - name: Prepare SSH key
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
@@ -32,7 +32,20 @@ jobs:
           chmod 600 ~/.ssh/us-market-review-deploy-key
           ssh-keyscan -H "${SERVER_HOST}" >> ~/.ssh/known_hosts
 
-          ssh -i ~/.ssh/us-market-review-deploy-key "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+      - name: Deploy and install over SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i ~/.ssh/us-market-review-deploy-key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o TCPKeepAlive=yes \
+            "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
           set -euo pipefail
 
           cd /opt/us-market-review
@@ -41,13 +54,30 @@ jobs:
           git rev-parse HEAD || true
 
           cp .env /tmp/us-market-review.env.bak || true
-
           git fetch origin
           git reset --hard origin/main
-
           cp /tmp/us-market-review.env.bak .env || true
 
           bash scripts/install_ubuntu.sh
+REMOTE
+
+      - name: Run report verification over SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i ~/.ssh/us-market-review-deploy-key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o TCPKeepAlive=yes \
+            "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          cd /opt/us-market-review
 
           set +e
           bash run_daily.sh
@@ -62,4 +92,4 @@ jobs:
           fi
 
           exit "${run_status}"
-          REMOTE
+REMOTE
