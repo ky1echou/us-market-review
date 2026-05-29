@@ -59,7 +59,7 @@ jobs:
           cp /tmp/us-market-review.env.bak .env || true
 
           bash scripts/install_ubuntu.sh
-REMOTE
+          REMOTE
 
       - name: Run report verification over SSH
         env:
@@ -92,4 +92,4 @@ REMOTE
           fi
 
           exit "${run_status}"
-REMOTE
+          REMOTE
