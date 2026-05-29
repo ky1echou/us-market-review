@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import StringIO
-from typing import Protocol
+from typing import Any, Protocol
 
 import pandas as pd
 import requests
@@ -63,7 +63,7 @@ class YFinanceProvider:
 class StooqProvider:
     name = "Stooq daily CSV"
     base_url = "https://stooq.com/q/d/l/"
-    symbol_map = {
+    default_symbol_map = {
         "^GSPC": "^spx",
         "^SPX": "^spx",
         "^IXIC": "^ndq",
@@ -74,6 +74,9 @@ class StooqProvider:
         "^VIX": "^vix",
         "BTC-USD": "btcusd",
     }
+
+    def __init__(self, symbol_map: dict[str, str] | None = None) -> None:
+        self.symbol_map = {**self.default_symbol_map, **(symbol_map or {})}
 
     def stooq_symbol(self, ticker: str) -> str:
         if ticker in self.symbol_map:
@@ -111,12 +114,14 @@ class StooqProvider:
         return frame
 
 
-def make_provider(name: str) -> MarketDataProvider:
+def make_provider(name: str, options: dict[str, Any] | None = None) -> MarketDataProvider:
     normalized = name.strip().lower()
+    options = options or {}
     if normalized == "yfinance":
         return YFinanceProvider()
     if normalized == "stooq":
-        return StooqProvider()
+        symbol_map = options.get("symbol_map") if isinstance(options, dict) else None
+        return StooqProvider(symbol_map=symbol_map if isinstance(symbol_map, dict) else None)
     if normalized in {"twelve_data", "twelvedata", "alpha_vantage", "alphavantage", "polygon"}:
         raise NotImplementedError(
             f"Market provider '{name}' is configured but not implemented yet. "
