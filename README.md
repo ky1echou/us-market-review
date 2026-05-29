@@ -1,6 +1,6 @@
 # us-market-review
 
-`us-market-review` 是一个部署在云服务器上的中文美股复盘自动化项目。它会在美股收盘后抓取行情和公开 RSS 新闻，生成 Markdown 与 PDF 报告，并可通过 Telegram Bot 或飞书 Webhook 推送。
+`us-market-review` 是一个部署在 Ubuntu 24.04 云服务器上的中文美股复盘自动化项目。它会在美股收盘后抓取行情和公开 RSS 新闻，生成 Markdown 与 PDF 报告，并可通过 Telegram Bot 或飞书 Webhook 推送。
 
 当前 MVP 数据来源：
 
@@ -9,18 +9,207 @@
 - 配置：`.env` 与 `config.yaml`
 - 日志：`logs/daily.log`
 
-项目不会编造关键数字。价格、涨跌幅、MA5/MA20 偏离、RSI 等关键数据都会在报告中保留来源、数据日期和获取时间。没有匹配到新闻证据的异动原因会明确写为“未在 RSS 中匹配到明确原因”。
+项目不会编造关键数字。价格、涨跌幅、MA5/MA20 偏离、RSI 等关键数据都会在报告中保留来源、数据日期和获取时间。行情抓取不足时，报告开头和推送消息会明确提示风险。
+
+## 一键安装
+
+把项目放到服务器目录后，例如 `/opt/us-market-review`，进入项目目录运行：
+
+```bash
+cd /opt/us-market-review
+bash scripts/install_ubuntu.sh
+```
+
+安装脚本会自动完成：
+
+- 检查 Ubuntu 系统；
+- 安装 `git`、`python3`、`python3-venv`、`python3-pip`、`curl`；
+- 安装 PDF 所需的 `wkhtmltopdf`、`fonts-wqy-zenhei`、`fonts-wqy-microhei`、`fonts-noto-cjk`；
+- 创建 `.venv`；
+- 安装 `requirements.txt`；
+- 创建 `logs/`、`reports/markdown/`、`reports/pdf/`、`data/raw/`、`data/processed/`；
+- 如果没有 `.env`，从 `.env.example` 复制一份；
+- 检查 `run_daily.sh` 和 `test_send.py`。
+
+## 配置推送
+
+安装完成后编辑 `.env`：
+
+```bash
+nano .env
+```
+
+Telegram 需要填写：
+
+```env
+ENABLE_TELEGRAM=true
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+```
+
+飞书 Webhook 需要填写：
+
+```env
+ENABLE_FEISHU=true
+FEISHU_WEBHOOK_URL=
+FEISHU_SECRET=
+```
+
+`FEISHU_SECRET` 只有在飞书机器人开启签名校验时才需要填写。不要把任何 Token、Webhook、密钥写进代码或 README。
+
+## 手动测试
+
+先测试 Telegram/飞书推送：
+
+```bash
+cd /opt/us-market-review
+source .venv/bin/activate
+python test_send.py
+```
+
+再手动生成一次报告：
+
+```bash
+bash run_daily.sh
+```
+
+报告输出位置：
+
+```text
+reports/markdown/us-market-review-YYYY-MM-DD.md
+reports/pdf/us-market-review-YYYY-MM-DD.pdf
+reports/html/us-market-review-YYYY-MM-DD.html
+```
+
+查看日志：
+
+```bash
+tail -n 100 logs/daily.log
+```
+
+## 设置定时运行
+
+目标时间：北京时间每周二到周六早上 7:30。
+
+打开定时任务：
+
+```bash
+crontab -e
+```
+
+加入：
+
+```cron
+CRON_TZ=Asia/Shanghai
+30 7 * * 2-6 cd /opt/us-market-review && bash run_daily.sh >> logs/daily.log 2>&1
+```
+
+保存后查看：
+
+```bash
+crontab -l
+```
+
+只要云服务器开机并且 cron 正常运行，本地电脑关机也不影响自动生成报告。
+
+## PDF 异常排查
+
+本项目不再使用不兼容的 TTC 字体注册方式生成 PDF。现在会先生成 HTML，再优先用 `wkhtmltopdf` 转换 PDF，并校验：
+
+- PDF 文件必须存在；
+- 文件大小不能过小；
+- 文件头必须是 `%PDF`。
+
+如果校验失败，程序会删除异常 PDF，不会把坏 PDF 推送到 Telegram，只会发送 Markdown，并提示：
+
+```text
+PDF 生成失败，仅发送 Markdown。
+```
+
+如果 PDF 仍异常，按顺序检查：
+
+```bash
+which wkhtmltopdf
+wkhtmltopdf --version
+fc-list | grep -E "WenQuanYi|Noto Sans CJK|DejaVu" | head
+bash scripts/install_ubuntu.sh
+bash run_daily.sh
+tail -n 200 logs/daily.log
+```
+
+Ubuntu 24.04 推荐字体包已经由安装脚本自动安装：
+
+```bash
+sudo apt install -y wkhtmltopdf fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk
+```
+
+## 行情限流排查
+
+Yahoo/yfinance 可能出现 `Too Many Requests. Rate limited.`。现在程序已经做了这些保护：
+
+- 不再一次性高频请求全部 ticker；
+- 每个 ticker 之间默认等待 `2` 秒；
+- 每个 ticker 默认重试 `3` 次；
+- 抓取成功后写入 `data/processed/market_cache/`；
+- 当实时抓取失败时，优先使用未过期的本地缓存；
+- 报告开头显示行情成功数量、失败数量、数据源、数据获取时间；
+- 成功率低于 `70%` 时，Telegram/飞书提示“行情数据不完整，请谨慎使用”。
+
+可在 `.env` 调整：
+
+```env
+MARKET_PROVIDER=yfinance
+MARKET_REQUEST_DELAY_SEC=2.0
+MARKET_RETRY_COUNT=3
+MARKET_RETRY_BACKOFF_SEC=10.0
+MARKET_CACHE_DIR=data/processed/market_cache
+MARKET_CACHE_MAX_AGE_HOURS=168
+MARKET_MIN_SUCCESS_RATIO=0.7
+```
+
+后续如果要切换 Twelve Data、Alpha Vantage、Polygon，可以继续沿用 `MARKET_PROVIDER` 这个配置入口扩展。
+
+## GitHub Actions 自动部署
+
+仓库已包含 `.github/workflows/deploy.yml`。当 `main` 分支有新提交时，GitHub Actions 会通过 SSH 登录服务器，执行：
+
+```bash
+cd /opt/us-market-review
+cp .env /tmp/us-market-review.env.bak || true
+git fetch origin
+git reset --hard origin/main
+cp /tmp/us-market-review.env.bak .env || true
+bash scripts/install_ubuntu.sh
+bash run_daily.sh
+```
+
+它会保留服务器上的 `.env`，不会覆盖你的 Telegram Token 或飞书 Webhook。
+
+你需要在 GitHub 仓库里配置 3 个 Repository Secrets：
+
+```text
+SERVER_HOST      服务器公网 IP 或域名
+SERVER_USER      SSH 用户名，例如 ubuntu 或 root
+SERVER_SSH_KEY   可以登录服务器的私钥内容
+```
+
+位置：GitHub 仓库页面 → Settings → Secrets and variables → Actions → New repository secret。
+
+部署前 workflow 会输出当前 commit hash。部署后会运行一次 `bash run_daily.sh` 验证。如果 PDF 失败或行情成功率低于 70%，Actions 日志会显示 warning，但不会删除服务器文件。
 
 ## 文件结构
 
 ```text
 us-market-review/
-  README.md
-  requirements.txt
   .env.example
+  .gitignore
+  .github/workflows/deploy.yml
+  README.md
   config.yaml
+  requirements.txt
   run_daily.sh
   test_send.py
+  scripts/install_ubuntu.sh
   src/
     fetch_market.py
     indicators.py
@@ -30,279 +219,6 @@ us-market-review/
     send_report.py
 ```
 
-## Ubuntu Server 24.04 部署
-
-以下步骤以项目部署在 `/opt/us-market-review` 为例。部署在云服务器后，任务由服务器 cron 执行，不依赖你的本地电脑，本地电脑关机也不会影响每日运行。
-
-### 1. 安装 Python 环境
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip ca-certificates curl fonts-noto-cjk
-```
-
-确认 Python 版本：
-
-```bash
-python3 --version
-```
-
-Ubuntu Server 24.04 默认 Python 版本满足本项目运行要求。
-
-### 2. 放置项目代码
-
-如果你已经把项目上传到服务器，例如 `/opt/us-market-review`：
-
-```bash
-cd /opt/us-market-review
-```
-
-如果目录还不存在：
-
-```bash
-sudo mkdir -p /opt/us-market-review
-sudo chown "$USER:$USER" /opt/us-market-review
-```
-
-然后把本项目文件上传到该目录。
-
-### 3. 创建 venv
-
-```bash
-cd /opt/us-market-review
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 4. 安装 requirements.txt
-
-```bash
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### 5. 配置 .env
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-建议保留这些基础配置：
-
-```env
-APP_TIMEZONE=Asia/Shanghai
-CONFIG_PATH=config.yaml
-OUTPUT_DIR=reports
-LOG_FILE=logs/daily.log
-REPORT_FONT_PATH=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-ENABLE_PDF=true
-```
-
-Telegram 推送配置：
-
-```env
-ENABLE_TELEGRAM=true
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-TELEGRAM_SEND_MARKDOWN=true
-TELEGRAM_SEND_PDF=true
-```
-
-飞书 Webhook 推送配置：
-
-```env
-ENABLE_FEISHU=true
-FEISHU_WEBHOOK_URL=
-FEISHU_SECRET=
-```
-
-如果飞书机器人开启了签名校验，把签名密钥填入 `FEISHU_SECRET`。所有密钥都只写在 `.env`，不要写进代码。
-
-行情、ETF、股票池、RSS 源、AH 映射都在 `config.yaml` 中维护，不需要编辑复杂 JSON。
-
-## 手动测试
-
-### 1. 测试推送
-
-先测试 Telegram/飞书是否配置正确：
-
-```bash
-cd /opt/us-market-review
-source .venv/bin/activate
-python test_send.py
-```
-
-你也可以自定义测试消息：
-
-```bash
-python test_send.py --message "us-market-review 云服务器推送测试"
-```
-
-返回示例：
-
-```text
-telegram: ok - message sent
-feishu: ok - message sent
-```
-
-如果某个渠道没有启用，会显示 `skip - disabled`。
-
-### 2. 测试行情和新闻抓取
-
-```bash
-python -m src.fetch_market --config config.yaml --output /tmp/us-market-snapshot.json
-python -m src.fetch_news --config config.yaml --output /tmp/us-market-news.json
-```
-
-### 3. 手动生成报告
-
-```bash
-bash run_daily.sh
-```
-
-生成结果位于：
-
-```text
-reports/YYYY-MM-DD/us-market-review-YYYY-MM-DD.md
-reports/YYYY-MM-DD/us-market-review-YYYY-MM-DD.pdf
-```
-
-同时会生成一个 HTML 版本，方便排查排版：
-
-```text
-reports/YYYY-MM-DD/us-market-review-YYYY-MM-DD.html
-```
-
-## 设置 Linux cron
-
-目标时间：北京时间每周二到周六早上 7:30。
-
-先确认服务器时区为北京时间：
-
-```bash
-timedatectl
-sudo timedatectl set-timezone Asia/Shanghai
-```
-
-编辑当前用户的 crontab：
-
-```bash
-crontab -e
-```
-
-加入这一行：
-
-```cron
-30 7 * * 2-6 cd /opt/us-market-review && /bin/bash /opt/us-market-review/run_daily.sh
-```
-
-保存后查看：
-
-```bash
-crontab -l
-```
-
-说明：cron 会在云服务器上运行，因此不依赖你的本地电脑。只要云服务器正常开机、网络可用、cron 服务运行，报告就会按时生成。
-
-确认 cron 服务状态：
-
-```bash
-systemctl status cron
-```
-
-如果未运行：
-
-```bash
-sudo systemctl enable --now cron
-```
-
-## 查看日志
-
-每次运行都会写入：
-
-```text
-logs/daily.log
-```
-
-实时查看：
-
-```bash
-tail -f /opt/us-market-review/logs/daily.log
-```
-
-查看最近 200 行：
-
-```bash
-tail -n 200 /opt/us-market-review/logs/daily.log
-```
-
-日志会记录：
-
-- 开始时间
-- 行情和新闻数据获取结果
-- Markdown/PDF 报告生成路径
-- Telegram、飞书、邮件推送结果
-- 失败原因和异常堆栈
-
-## 常见问题
-
-### PDF 中文显示异常
-
-确认安装了中文字体：
-
-```bash
-sudo apt install -y fonts-noto-cjk
-ls /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-```
-
-然后在 `.env` 中设置：
-
-```env
-REPORT_FONT_PATH=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-```
-
-### Telegram 推送失败
-
-检查：
-
-- `ENABLE_TELEGRAM=true`
-- `TELEGRAM_BOT_TOKEN` 是否正确
-- `TELEGRAM_CHAT_ID` 是否正确
-- 服务器是否能访问 `https://api.telegram.org`
-
-运行：
-
-```bash
-python test_send.py
-```
-
-### 飞书推送失败
-
-检查：
-
-- `ENABLE_FEISHU=true`
-- `FEISHU_WEBHOOK_URL` 是否正确
-- 如果机器人启用了签名校验，`FEISHU_SECRET` 是否正确
-
-运行：
-
-```bash
-python test_send.py
-```
-
-### cron 没有触发
-
-检查：
-
-```bash
-crontab -l
-systemctl status cron
-tail -n 200 /opt/us-market-review/logs/daily.log
-```
-
-也可以临时把 cron 时间改成几分钟后测试，确认能自动写入日志。
-
 ## 免责声明
 
-本项目自动生成的内容仅用于信息整理和研究复盘，不构成投资建议。美股盘后财报、宏观数据、监管新闻和流动性变化可能改变结论。
+本项目自动生成的内容仅用于信息整理和研究复盘，不构成投资建议。
