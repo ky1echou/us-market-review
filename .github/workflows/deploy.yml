@@ -33,30 +33,33 @@ jobs:
           ssh-keyscan -H "${SERVER_HOST}" >> ~/.ssh/known_hosts
 
           ssh -i ~/.ssh/us-market-review-deploy-key "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
-            set -euo pipefail
+          set -euo pipefail
 
-            cd /opt/us-market-review
-            echo "Server current commit before deploy:"
-            git rev-parse HEAD || true
+          cd /opt/us-market-review
 
-            cp .env /tmp/us-market-review.env.bak || true
-            git fetch origin
-            git reset --hard origin/main
-            cp /tmp/us-market-review.env.bak .env || true
+          echo "Server current commit before deploy:"
+          git rev-parse HEAD || true
 
-            bash scripts/install_ubuntu.sh
+          cp .env /tmp/us-market-review.env.bak || true
 
-            set +e
-            bash run_daily.sh
-            run_status=$?
-            set -e
+          git fetch origin
+          git reset --hard origin/main
 
-            echo "Recent server log:"
-            tail -n 120 logs/daily.log || true
+          cp /tmp/us-market-review.env.bak .env || true
 
-            if grep -E "PDF 生成失败|行情数据不完整，请谨慎使用|行情质量警告" logs/daily.log | tail -n 20; then
-              echo "::warning::Deployment finished, but report warnings were found. Check logs/daily.log on the server."
-            fi
+          bash scripts/install_ubuntu.sh
 
-            exit "${run_status}"
-REMOTE
+          set +e
+          bash run_daily.sh
+          run_status=$?
+          set -e
+
+          echo "Recent server log:"
+          tail -n 120 logs/daily.log || true
+
+          if grep -E "PDF 生成失败|行情数据不完整，请谨慎使用|行情质量警告" logs/daily.log | tail -n 20; then
+            echo "::warning::Deployment finished, but report warnings were found. Check logs/daily.log on the server."
+          fi
+
+          exit "${run_status}"
+          REMOTE
