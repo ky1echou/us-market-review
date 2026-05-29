@@ -13,6 +13,18 @@ market:
     - yfinance
     - stooq
 
+  # 备用源代码映射。Stooq 对指数使用自己的代码，ETF/股票默认自动转为 xxx.us。
+  provider_options:
+    stooq:
+      symbol_map:
+        ^GSPC: ^spx
+        ^IXIC: ^ndq
+        ^DJI: ^dji
+        ^RUT: ^rut
+        ^SOX: ^sox
+        ^VIX: ^vix
+        BTC-USD: btcusd
+
   period: 90d
   interval: 1d
 
