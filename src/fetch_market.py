@@ -11,13 +11,13 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yaml
-import yfinance as yf
 from dotenv import load_dotenv
 
 from .indicators import summarize_price_frame
+from .market_data_provider import make_provider, provider_display_name
 
 
-DEFAULT_DATA_SOURCE = "Yahoo Finance via yfinance"
+DEFAULT_PROVIDER_CHAIN = ["yfinance", "stooq"]
 
 
 def env_float(name: str, default: float) -> float:
@@ -40,6 +40,16 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def parse_provider_chain(value: Any) -> list[str]:
+    if value is None or value == "":
+        return DEFAULT_PROVIDER_CHAIN.copy()
+    if isinstance(value, list):
+        providers = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        providers = [item.strip() for item in str(value).split(",") if item.strip()]
+    return providers or DEFAULT_PROVIDER_CHAIN.copy()
+
+
 def load_config(config_path: str | Path) -> dict[str, Any]:
     load_dotenv()
     path = Path(config_path)
@@ -59,14 +69,17 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         config["app"]["output_dir"] = os.getenv("OUTPUT_DIR")
 
     market = config.setdefault("market", {})
-    if os.getenv("MARKET_PROVIDER"):
-        market["provider"] = os.getenv("MARKET_PROVIDER")
+    if os.getenv("MARKET_PROVIDER_CHAIN"):
+        market["provider_chain"] = parse_provider_chain(os.getenv("MARKET_PROVIDER_CHAIN"))
+    elif os.getenv("MARKET_PROVIDER"):
+        provider = os.getenv("MARKET_PROVIDER", "yfinance")
+        market["provider_chain"] = parse_provider_chain(provider)
     if os.getenv("MARKET_REQUEST_DELAY_SEC"):
-        market["request_delay_sec"] = env_float("MARKET_REQUEST_DELAY_SEC", float(market.get("request_delay_sec", 2.0)))
+        market["request_delay_sec"] = env_float("MARKET_REQUEST_DELAY_SEC", float(market.get("request_delay_sec", 1.0)))
     if os.getenv("MARKET_RETRY_COUNT"):
-        market["retry_count"] = env_int("MARKET_RETRY_COUNT", int(market.get("retry_count", 3)))
+        market["retry_count"] = env_int("MARKET_RETRY_COUNT", int(market.get("retry_count", 1)))
     if os.getenv("MARKET_RETRY_BACKOFF_SEC"):
-        market["retry_backoff_sec"] = env_float("MARKET_RETRY_BACKOFF_SEC", float(market.get("retry_backoff_sec", 10.0)))
+        market["retry_backoff_sec"] = env_float("MARKET_RETRY_BACKOFF_SEC", float(market.get("retry_backoff_sec", 4.0)))
     if os.getenv("MARKET_CACHE_DIR"):
         market["cache_dir"] = os.getenv("MARKET_CACHE_DIR")
     if os.getenv("MARKET_CACHE_MAX_AGE_HOURS"):
@@ -112,13 +125,6 @@ def universe_from_config(config: dict[str, Any]) -> list[dict[str, str]]:
     return universe
 
 
-def data_source_for_provider(provider: str) -> str:
-    provider = provider.lower().strip()
-    if provider == "yfinance":
-        return DEFAULT_DATA_SOURCE
-    return f"{provider} market data provider"
-
-
 def safe_cache_name(ticker: str, period: str, interval: str) -> str:
     cleaned = "".join(char if char.isalnum() else "_" for char in ticker)
     return f"{cleaned}_{period}_{interval}.csv"
@@ -126,35 +132,6 @@ def safe_cache_name(ticker: str, period: str, interval: str) -> str:
 
 def cache_path(cache_dir: str | Path, ticker: str, period: str, interval: str) -> Path:
     return Path(cache_dir) / safe_cache_name(ticker, period, interval)
-
-
-def normalize_history_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame is None or frame.empty:
-        return pd.DataFrame()
-
-    clean = frame.copy()
-    if "Date" in clean.columns or "Datetime" in clean.columns:
-        date_column = "Date" if "Date" in clean.columns else "Datetime"
-        clean[date_column] = pd.to_datetime(clean[date_column])
-        clean = clean.set_index(date_column)
-    clean = clean.sort_index()
-    clean.index.name = "Date"
-    return clean
-
-
-def fetch_history_yfinance(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    frame = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
-    return normalize_history_frame(frame)
-
-
-def fetch_history_from_provider(provider: str, ticker: str, period: str, interval: str) -> pd.DataFrame:
-    provider = provider.lower().strip()
-    if provider == "yfinance":
-        return fetch_history_yfinance(ticker, period, interval)
-    raise NotImplementedError(
-        f"Market provider '{provider}' is not implemented yet. "
-        "The fetch layer is structured so Twelve Data, Alpha Vantage, Polygon, or another provider can be added here."
-    )
 
 
 def save_cache(frame: pd.DataFrame, path: Path) -> None:
@@ -180,39 +157,46 @@ def load_cache(path: Path, max_age_hours: int) -> tuple[pd.DataFrame, str | None
     return frame, None
 
 
-def fetch_history_with_retry_and_cache(
+def fetch_history_with_provider_chain(
     ticker: str,
     period: str,
     interval: str,
-    provider: str,
+    provider_chain: list[str],
     cache_dir: str | Path,
     retry_count: int,
     retry_backoff_sec: float,
     cache_max_age_hours: int,
-) -> tuple[pd.DataFrame, str | None, bool, str | None]:
+) -> tuple[pd.DataFrame, str | None, bool, str | None, str]:
     errors: list[str] = []
-    for attempt in range(1, retry_count + 1):
+    for provider_name in provider_chain:
         try:
-            frame = fetch_history_from_provider(provider, ticker, period, interval)
-            if frame is None or frame.empty:
-                raise ValueError("empty price history")
-            save_cache(frame, cache_path(cache_dir, ticker, period, interval))
-            return frame, None, False, None
-        except Exception as exc:  # noqa: BLE001 - retry and fall back to cache.
-            errors.append(f"attempt {attempt}/{retry_count}: {exc}")
-            if attempt < retry_count:
-                time.sleep(retry_backoff_sec * attempt)
+            provider = make_provider(provider_name)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{provider_name}: {exc}")
+            continue
+
+        for attempt in range(1, retry_count + 1):
+            try:
+                frame = provider.fetch_history(ticker, period, interval)
+                if frame is None or frame.empty:
+                    raise ValueError("empty price history")
+                save_cache(frame, cache_path(cache_dir, ticker, period, interval))
+                return frame, None, False, None, provider.name
+            except Exception as exc:  # noqa: BLE001 - try next provider, then cache.
+                errors.append(f"{provider.name} attempt {attempt}/{retry_count}: {exc}")
+                if attempt < retry_count:
+                    time.sleep(retry_backoff_sec * attempt)
 
     cached_frame, cache_error = load_cache(cache_path(cache_dir, ticker, period, interval), cache_max_age_hours)
     if not cached_frame.empty:
-        return cached_frame, "; ".join(errors), True, None
+        return cached_frame, "; ".join(errors), True, None, "Local market cache"
 
     error_text = "; ".join(errors)
     if cache_error:
         error_text = f"{error_text}; cache fallback failed: {cache_error}"
     else:
         error_text = f"{error_text}; no cache fallback available"
-    return pd.DataFrame(), error_text, False, cache_error
+    return pd.DataFrame(), error_text, False, cache_error, ""
 
 
 def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: str, min_success_ratio: float) -> dict[str, Any]:
@@ -223,17 +207,17 @@ def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: 
     failed = total - len(usable)
     success_ratio = len(usable) / total if total else 0.0
     live_success_ratio = len(live_success) / total if total else 0.0
+    provider_counts: dict[str, int] = {}
+    for asset in usable:
+        provider = str(asset.get("source", {}).get("provider") or "unknown")
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
 
     warnings: list[str] = []
-    if success_ratio < min_success_ratio or live_success_ratio < min_success_ratio:
+    formal_report_allowed = live_success_ratio >= min_success_ratio
+    if not formal_report_allowed:
+        warnings.append("今日行情数据抓取失败，未生成正式美股复盘，请检查数据源。")
+    elif success_ratio < min_success_ratio:
         warnings.append("行情数据不完整，请谨慎使用")
-    if live_success_ratio < min_success_ratio:
-        if cache_success:
-            warnings.append("实时行情抓取不足，部分数据来自本地缓存，请谨慎使用")
-        else:
-            warnings.append("当日实时行情抓取不足，请谨慎使用")
-    if total and len(live_success) == 0:
-        warnings.append("当日实时行情抓取失败，报告不应视为完整行情复盘")
 
     return {
         "source": source,
@@ -248,8 +232,20 @@ def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: 
         "min_success_ratio": min_success_ratio,
         "data_complete": success_ratio >= min_success_ratio,
         "live_data_complete": live_success_ratio >= min_success_ratio,
+        "formal_report_allowed": formal_report_allowed,
+        "provider_counts": provider_counts,
         "warnings": warnings,
     }
+
+
+def provider_chain_source(provider_chain: list[str]) -> str:
+    names: list[str] = []
+    for provider in provider_chain:
+        try:
+            names.append(provider_display_name(provider))
+        except Exception:  # noqa: BLE001
+            names.append(provider)
+    return " -> ".join(names)
 
 
 def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
@@ -257,11 +253,11 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
     market = config.get("market", {})
     period = market.get("period", "90d")
     interval = market.get("interval", "1d")
-    provider = market.get("provider", "yfinance")
-    source = data_source_for_provider(provider)
-    request_delay_sec = float(market.get("request_delay_sec", 2.0))
-    retry_count = int(market.get("retry_count", 3))
-    retry_backoff_sec = float(market.get("retry_backoff_sec", 10.0))
+    provider_chain = parse_provider_chain(market.get("provider_chain", market.get("provider", DEFAULT_PROVIDER_CHAIN)))
+    source = provider_chain_source(provider_chain)
+    request_delay_sec = float(market.get("request_delay_sec", 1.0))
+    retry_count = max(1, int(market.get("retry_count", 1)))
+    retry_backoff_sec = float(market.get("retry_backoff_sec", 4.0))
     cache_dir = market.get("cache_dir", "data/processed/market_cache")
     cache_max_age_hours = int(market.get("cache_max_age_hours", 168))
     min_success_ratio = float(market.get("min_success_ratio", 0.7))
@@ -273,11 +269,11 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
         if index > 0 and request_delay_sec > 0:
             time.sleep(request_delay_sec)
 
-        frame, error, from_cache, cache_error = fetch_history_with_retry_and_cache(
+        frame, error, from_cache, cache_error, actual_provider = fetch_history_with_provider_chain(
             asset["ticker"],
             period,
             interval,
-            provider,
+            provider_chain,
             cache_dir,
             retry_count,
             retry_backoff_sec,
@@ -285,7 +281,8 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
         )
         summary = summarize_price_frame(frame)
         source_info = {
-            "provider": source,
+            "provider": actual_provider or source,
+            "provider_chain": source,
             "ticker": asset["ticker"],
             "period": period,
             "interval": interval,
@@ -309,7 +306,7 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "metadata": {
             "source": source,
-            "provider": provider,
+            "provider_chain": provider_chain,
             "period": period,
             "interval": interval,
             "fetched_at": fetched_at,
