@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from io import StringIO
+from typing import Protocol
+
+import pandas as pd
+import requests
+import yfinance as yf
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    frame: pd.DataFrame
+    provider: str
+
+
+class MarketDataProvider(Protocol):
+    name: str
+
+    def fetch_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
+        ...
+
+
+def normalize_history_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    clean = frame.copy()
+    if "Date" in clean.columns or "Datetime" in clean.columns:
+        date_column = "Date" if "Date" in clean.columns else "Datetime"
+        clean[date_column] = pd.to_datetime(clean[date_column])
+        clean = clean.set_index(date_column)
+    clean = clean.sort_index()
+    clean.index.name = "Date"
+    return clean
+
+
+def period_to_days(period: str) -> int | None:
+    value = str(period or "").strip().lower()
+    if value in {"", "max"}:
+        return None
+    try:
+        if value.endswith("d"):
+            return int(value[:-1])
+        if value.endswith("mo"):
+            return int(value[:-2]) * 31
+        if value.endswith("y"):
+            return int(value[:-1]) * 365
+    except ValueError:
+        return None
+    return None
+
+
+class YFinanceProvider:
+    name = "Yahoo Finance via yfinance"
+
+    def fetch_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
+        frame = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+        return normalize_history_frame(frame)
+
+
+class StooqProvider:
+    name = "Stooq daily CSV"
+    base_url = "https://stooq.com/q/d/l/"
+    symbol_map = {
+        "^GSPC": "^spx",
+        "^SPX": "^spx",
+        "^IXIC": "^ndq",
+        "^NDX": "^ndq",
+        "^DJI": "^dji",
+        "^RUT": "^rut",
+        "^SOX": "^sox",
+        "^VIX": "^vix",
+        "BTC-USD": "btcusd",
+    }
+
+    def stooq_symbol(self, ticker: str) -> str:
+        if ticker in self.symbol_map:
+            return self.symbol_map[ticker]
+        cleaned = ticker.replace("-", ".").lower()
+        if cleaned.startswith("^"):
+            return cleaned
+        if "." not in cleaned:
+            return f"{cleaned}.us"
+        return cleaned
+
+    def fetch_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
+        if interval not in {"1d", "1D", "d", "D"}:
+            raise ValueError("Stooq fallback only supports daily history")
+
+        response = requests.get(
+            self.base_url,
+            params={"s": self.stooq_symbol(ticker), "i": "d"},
+            headers={"User-Agent": "us-market-review/0.1"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        if "No data" in response.text or not response.text.strip():
+            raise ValueError("empty Stooq response")
+
+        frame = pd.read_csv(StringIO(response.text))
+        if frame.empty or "Date" not in frame.columns or "Close" not in frame.columns:
+            raise ValueError("invalid Stooq CSV response")
+
+        frame = normalize_history_frame(frame)
+        days = period_to_days(period)
+        if days:
+            cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days + 5)
+            frame = frame[frame.index >= cutoff]
+        return frame
+
+
+def make_provider(name: str) -> MarketDataProvider:
+    normalized = name.strip().lower()
+    if normalized == "yfinance":
+        return YFinanceProvider()
+    if normalized == "stooq":
+        return StooqProvider()
+    if normalized in {"twelve_data", "twelvedata", "alpha_vantage", "alphavantage", "polygon"}:
+        raise NotImplementedError(
+            f"Market provider '{name}' is configured but not implemented yet. "
+            "The provider abstraction is ready for Twelve Data, Alpha Vantage, and Polygon."
+        )
+    raise ValueError(f"Unsupported market provider: {name}")
+
+
+def provider_display_name(name: str) -> str:
+    return make_provider(name).name
