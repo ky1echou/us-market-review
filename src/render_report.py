@@ -27,7 +27,7 @@ from .send_report import (
 )
 
 
-MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败，未生成正式美股复盘，请检查数据源。"
+MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。"
 
 
 def slug_date(timezone_name: str) -> str:
@@ -275,15 +275,34 @@ def push_alerts_from_run(warnings: list[str]) -> list[str]:
     return alerts
 
 
-def send_market_failure_alert() -> list[PushResult]:
+def market_failure_status_message(market_data: dict[str, Any]) -> str:
+    metadata = market_data.get("metadata", {})
+    total = int(metadata.get("total_count") or 0)
+    success = int(metadata.get("live_success_count") or 0)
+    failed = max(total - success, 0)
+    success_ratio = float(metadata.get("live_success_ratio") or 0.0) * 100
+    return "\n".join(
+        [
+            MARKET_FAILURE_MESSAGE,
+            f"行情成功数量: {success}/{total}",
+            f"行情失败数量: {failed}",
+            f"行情成功率: {success_ratio:.1f}%",
+            f"数据源: {metadata.get('source', 'N/A')}",
+            f"获取时间: {metadata.get('fetched_at', 'N/A')}",
+        ]
+    )
+
+
+def send_market_failure_alert(market_data: dict[str, Any]) -> list[PushResult]:
+    message = market_failure_status_message(market_data)
     results: list[PushResult] = []
     if telegram_enabled():
-        results.append(send_telegram_message(MARKET_FAILURE_MESSAGE))
+        results.append(send_telegram_message(message))
     else:
         results.append(PushResult("telegram", False, False, "disabled"))
 
     if feishu_enabled():
-        results.append(send_feishu_message(MARKET_FAILURE_MESSAGE))
+        results.append(send_feishu_message(message))
     else:
         results.append(PushResult("feishu", False, False, "disabled"))
     return results
@@ -291,7 +310,10 @@ def send_market_failure_alert() -> list[PushResult]:
 
 def formal_report_allowed(market_data: dict[str, Any]) -> bool:
     metadata = market_data.get("metadata", {})
-    return bool(metadata.get("formal_report_allowed", metadata.get("live_data_complete", False)))
+    total = int(metadata.get("total_count") or 0)
+    live_success_ratio = float(metadata.get("live_success_ratio") or 0.0)
+    min_success_ratio = float(metadata.get("min_success_ratio") or 0.7)
+    return total > 0 and live_success_ratio >= min_success_ratio
 
 
 def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[Path | None, Path | None, list[str], list[PushResult]]:
@@ -310,11 +332,12 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
             logger.warning("行情失败或降级: ticker=%s from_cache=%s provider=%s reason=%s", asset.get("ticker"), asset.get("from_cache"), asset.get("source", {}).get("provider"), asset.get("error"))
 
     if not formal_report_allowed(market_data):
-        logger.error("失败原因: %s %s", MARKET_FAILURE_MESSAGE, market_fetch_summary(market_data))
-        push_results = send_market_failure_alert()
+        message = market_failure_status_message(market_data)
+        logger.error("失败原因: %s", message.replace("\n", " | "))
+        push_results = send_market_failure_alert(market_data)
         log_push_results(logger, push_results)
         logger.info("运行结束: market_data_failed_no_formal_report")
-        return None, None, [MARKET_FAILURE_MESSAGE], push_results
+        return None, None, [message], push_results
 
     news_data = fetch_news(config)
     logger.info("数据获取结果: %s", news_fetch_summary(news_data))
