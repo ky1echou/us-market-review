@@ -7,9 +7,25 @@ app:
   report_language: zh-CN
 
 market:
+  # 行情源适配层。MVP 默认继续使用 yfinance；后续可在 src/fetch_market.py 中接入
+  # Twelve Data / Alpha Vantage / Polygon 等正式行情源。
+  provider: yfinance
+
   # yfinance history 参数。MVP 使用日线，足够计算 MA5/MA20/RSI14。
   period: 90d
   interval: 1d
+
+  # 为降低 Yahoo/yfinance 限流风险，逐个 ticker 抓取，并加入间隔与重试。
+  request_delay_sec: 2.0
+  retry_count: 3
+  retry_backoff_sec: 10.0
+
+  # 抓取成功后写入本地缓存；当 Yahoo 限流时可降级使用缓存，并在报告中标注。
+  cache_dir: data/processed/market_cache
+  cache_max_age_hours: 168
+
+  # 行情可用率低于该阈值时，报告和 Telegram/飞书推送都会提示“行情数据不完整”。
+  min_success_ratio: 0.7
 
   benchmarks:
     - ticker: ^GSPC
@@ -197,5 +213,5 @@ report:
   include_raw_audit_section: true
   pdf:
     enabled: true
-    font_path: ""
-
+    wkhtmltopdf_path: ""
+    min_bytes: 5000
