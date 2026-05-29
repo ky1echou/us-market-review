@@ -47,7 +47,10 @@ def parse_provider_chain(value: Any) -> list[str]:
         providers = [str(item).strip() for item in value if str(item).strip()]
     else:
         providers = [item.strip() for item in str(value).split(",") if item.strip()]
-    return providers or DEFAULT_PROVIDER_CHAIN.copy()
+    providers = providers or DEFAULT_PROVIDER_CHAIN.copy()
+    if [provider.lower() for provider in providers] == ["yfinance"]:
+        return DEFAULT_PROVIDER_CHAIN.copy()
+    return providers
 
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
@@ -72,8 +75,7 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
     if os.getenv("MARKET_PROVIDER_CHAIN"):
         market["provider_chain"] = parse_provider_chain(os.getenv("MARKET_PROVIDER_CHAIN"))
     elif os.getenv("MARKET_PROVIDER"):
-        provider = os.getenv("MARKET_PROVIDER", "yfinance")
-        market["provider_chain"] = parse_provider_chain(provider)
+        market["provider_chain"] = parse_provider_chain(os.getenv("MARKET_PROVIDER", "yfinance"))
     if os.getenv("MARKET_REQUEST_DELAY_SEC"):
         market["request_delay_sec"] = env_float("MARKET_REQUEST_DELAY_SEC", float(market.get("request_delay_sec", 1.0)))
     if os.getenv("MARKET_RETRY_COUNT"):
