@@ -7,24 +7,24 @@ app:
   report_language: zh-CN
 
 market:
-  # 行情源适配层。MVP 默认继续使用 yfinance；后续可在 src/fetch_market.py 中接入
-  # Twelve Data / Alpha Vantage / Polygon 等正式行情源。
-  provider: yfinance
+  # 行情源按顺序尝试：yfinance 失败后自动切到 Stooq，仍失败再使用本地缓存。
+  # 后续可继续扩展 Twelve Data / Alpha Vantage / Polygon。
+  provider_chain:
+    - yfinance
+    - stooq
 
-  # yfinance history 参数。MVP 使用日线，足够计算 MA5/MA20/RSI14。
   period: 90d
   interval: 1d
 
-  # 为降低 Yahoo/yfinance 限流风险，逐个 ticker 抓取，并加入间隔与重试。
-  request_delay_sec: 2.0
-  retry_count: 3
-  retry_backoff_sec: 10.0
+  # 减少限流：逐个 ticker 抓取，失败后切换备用源。
+  request_delay_sec: 1.0
+  retry_count: 1
+  retry_backoff_sec: 4.0
 
-  # 抓取成功后写入本地缓存；当 Yahoo 限流时可降级使用缓存，并在报告中标注。
   cache_dir: data/processed/market_cache
   cache_max_age_hours: 168
 
-  # 行情可用率低于该阈值时，报告和 Telegram/飞书推送都会提示“行情数据不完整”。
+  # 实时行情成功率低于该阈值时，不生成正式 PDF，只推送失败提示。
   min_success_ratio: 0.7
 
   benchmarks:
@@ -36,8 +36,18 @@ market:
       name: 道琼斯工业
     - ticker: ^RUT
       name: 罗素2000
+    - ticker: ^SOX
+      name: 费城半导体
+    - ticker: ^VIX
+      name: VIX波动率
 
   sector_etfs:
+    - ticker: SPY
+      name: 标普500ETF
+    - ticker: QQQ
+      name: 纳斯达克100ETF
+    - ticker: IWM
+      name: 罗素2000ETF
     - ticker: XLK
       name: 科技
     - ticker: XLC
@@ -61,9 +71,9 @@ market:
     - ticker: XLRE
       name: 房地产
     - ticker: SMH
-      name: 半导体
+      name: 半导体ETF
     - ticker: SOXX
-      name: 半导体
+      name: 半导体ETF
     - ticker: ARKK
       name: 创新成长
     - ticker: KWEB
@@ -93,10 +103,25 @@ market:
       theme: 电动车/机器人
     - ticker: AVGO
       name: 博通
-      theme: AI网络
+      theme: AI网络/ASIC
     - ticker: AMD
       name: AMD
       theme: AI芯片
+    - ticker: MU
+      name: 美光
+      theme: AI存储/HBM
+    - ticker: MRVL
+      name: Marvell
+      theme: AI网络/ASIC
+    - ticker: ARM
+      name: Arm
+      theme: AI芯片IP
+    - ticker: SNOW
+      name: Snowflake
+      theme: AI数据云
+    - ticker: NOW
+      name: ServiceNow
+      theme: AI软件/SaaS
     - ticker: NFLX
       name: 奈飞
       theme: 流媒体
@@ -136,81 +161,67 @@ news:
     - name: Nasdaq Markets
       url: https://www.nasdaq.com/feed/rssoutbound?category=Markets
 
-themes:
-  ai_keywords:
-    - AI
-    - artificial intelligence
-    - Nvidia
-    - GPU
-    - semiconductor
-    - data center
-    - cloud
-    - inference
-    - OpenAI
-    - Microsoft
-    - Meta
-    - Amazon
-    - Alphabet
-  macro_keywords:
-    - Fed
-    - inflation
-    - CPI
-    - PCE
-    - payroll
-    - Treasury
-    - yield
-    - dollar
-    - tariff
-    - oil
-    - geopolitical
-  china_keywords:
-    - China
-    - Hong Kong
-    - ADR
-    - Alibaba
-    - Tencent
-    - JD.com
-    - PDD
-    - Baidu
-    - EV
-
 ah_mapping:
   - us_ticker: NVDA
     us_name: 英伟达
     theme: AI算力
+    mapping_strength: 强映射
     a_h_mapping: 光模块、PCB、服务器、液冷、算力租赁、半导体设备
     watch_points: 关注美股AI芯片与半导体ETF对A股算力链情绪映射
   - us_ticker: AMD
     us_name: AMD
     theme: AI芯片
+    mapping_strength: 强映射
     a_h_mapping: GPU产业链、先进封装、服务器
     watch_points: 关注AI芯片竞争格局和数据中心需求
   - us_ticker: AVGO
     us_name: 博通
     theme: AI网络/ASIC
+    mapping_strength: 强映射
     a_h_mapping: 交换机、光通信、ASIC、PCB
     watch_points: 关注AI网络和定制芯片需求
+  - us_ticker: MU
+    us_name: 美光
+    theme: AI存储/HBM
+    mapping_strength: 强映射
+    a_h_mapping: 存储、HBM、半导体材料设备
+    watch_points: 关注AI服务器存储需求对存储链映射
+  - us_ticker: MRVL
+    us_name: Marvell
+    theme: AI网络/ASIC
+    mapping_strength: 强映射
+    a_h_mapping: 光通信、交换芯片、ASIC、PCB
+    watch_points: 关注AI网络链弹性
   - us_ticker: MSFT
     us_name: 微软
     theme: 云与AI应用
+    mapping_strength: 弱映射
     a_h_mapping: 云计算、软件、AI应用、数据中心
     watch_points: 关注云资本开支和AI商业化
+  - us_ticker: GOOGL
+    us_name: Alphabet
+    theme: AI应用/云
+    mapping_strength: 弱映射
+    a_h_mapping: AI应用、云计算、广告科技
+    watch_points: 关注云增长与AI应用竞争
   - us_ticker: TSLA
     us_name: 特斯拉
     theme: 电动车/机器人
+    mapping_strength: 情绪映射
     a_h_mapping: 汽车零部件、机器人、智能驾驶、锂电
     watch_points: 关注交付、价格、FSD与机器人催化
   - us_ticker: KWEB
     us_name: 中概互联网ETF
     theme: 中概/港股互联网
+    mapping_strength: 情绪映射
     a_h_mapping: 港股互联网、平台经济、恒生科技
     watch_points: 关注中概风险偏好对港股和A股互联网映射
 
 report:
   title: 中文美股复盘报告
-  author: us-market-review
+  author: AI投研 · 美股版
   top_movers_count: 5
-  include_raw_audit_section: true
+  include_raw_audit_section: false
   pdf:
     enabled: true
     wkhtmltopdf_path: ""
