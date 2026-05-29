@@ -159,11 +159,17 @@ def load_cache(path: Path, max_age_hours: int) -> tuple[pd.DataFrame, str | None
     return frame, None
 
 
+def provider_options_for(provider_options: dict[str, Any], provider_name: str) -> dict[str, Any]:
+    value = provider_options.get(provider_name) or provider_options.get(provider_name.lower()) or {}
+    return value if isinstance(value, dict) else {}
+
+
 def fetch_history_with_provider_chain(
     ticker: str,
     period: str,
     interval: str,
     provider_chain: list[str],
+    provider_options: dict[str, Any],
     cache_dir: str | Path,
     retry_count: int,
     retry_backoff_sec: float,
@@ -172,7 +178,7 @@ def fetch_history_with_provider_chain(
     errors: list[str] = []
     for provider_name in provider_chain:
         try:
-            provider = make_provider(provider_name)
+            provider = make_provider(provider_name, provider_options_for(provider_options, provider_name))
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{provider_name}: {exc}")
             continue
@@ -217,7 +223,7 @@ def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: 
     warnings: list[str] = []
     formal_report_allowed = live_success_ratio >= min_success_ratio
     if not formal_report_allowed:
-        warnings.append("今日行情数据抓取失败，未生成正式美股复盘，请检查数据源。")
+        warnings.append("今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。")
     elif success_ratio < min_success_ratio:
         warnings.append("行情数据不完整，请谨慎使用")
 
@@ -256,6 +262,7 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
     period = market.get("period", "90d")
     interval = market.get("interval", "1d")
     provider_chain = parse_provider_chain(market.get("provider_chain", market.get("provider", DEFAULT_PROVIDER_CHAIN)))
+    provider_options = market.get("provider_options", {}) if isinstance(market.get("provider_options", {}), dict) else {}
     source = provider_chain_source(provider_chain)
     request_delay_sec = float(market.get("request_delay_sec", 1.0))
     retry_count = max(1, int(market.get("retry_count", 1)))
@@ -276,6 +283,7 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
             period,
             interval,
             provider_chain,
+            provider_options,
             cache_dir,
             retry_count,
             retry_backoff_sec,
