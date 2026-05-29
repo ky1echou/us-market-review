@@ -1,0 +1,62 @@
+name: Deploy to Ubuntu Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show commit hash
+        run: |
+          echo "Deploying commit: ${GITHUB_SHA}"
+
+      - name: Deploy over SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SERVER_HOST}" ] || [ -z "${SERVER_USER}" ] || [ -z "${SERVER_SSH_KEY}" ]; then
+            echo "::error::Missing one or more required repository secrets: SERVER_HOST, SERVER_USER, SERVER_SSH_KEY"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "${SERVER_SSH_KEY}" > ~/.ssh/us-market-review-deploy-key
+          chmod 600 ~/.ssh/us-market-review-deploy-key
+          ssh-keyscan -H "${SERVER_HOST}" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/us-market-review-deploy-key "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+            set -euo pipefail
+
+            cd /opt/us-market-review
+            echo "Server current commit before deploy:"
+            git rev-parse HEAD || true
+
+            cp .env /tmp/us-market-review.env.bak || true
+            git fetch origin
+            git reset --hard origin/main
+            cp /tmp/us-market-review.env.bak .env || true
+
+            bash scripts/install_ubuntu.sh
+
+            set +e
+            bash run_daily.sh
+            run_status=$?
+            set -e
+
+            echo "Recent server log:"
+            tail -n 120 logs/daily.log || true
+
+            if grep -E "PDF 生成失败|行情数据不完整，请谨慎使用|行情质量警告" logs/daily.log | tail -n 20; then
+              echo "::warning::Deployment finished, but report warnings were found. Check logs/daily.log on the server."
+            fi
+
+            exit "${run_status}"
+REMOTE
