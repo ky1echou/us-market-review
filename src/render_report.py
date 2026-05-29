@@ -1,25 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import html
 import logging
 import os
-import re
-import textwrap
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
 import markdown as markdown_lib
 from dotenv import load_dotenv
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import PageBreak, Paragraph, Preformatted, SimpleDocTemplate, Spacer
 
 from .fetch_market import fetch_market_data, load_config
 from .fetch_news import fetch_news
@@ -29,6 +22,16 @@ from .send_report import PushResult, send_outputs
 
 def slug_date(timezone_name: str) -> str:
     return datetime.now(ZoneInfo(timezone_name)).date().isoformat()
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def log_path() -> Path:
@@ -53,28 +56,46 @@ def setup_logger() -> logging.Logger:
     return logger
 
 
-def ensure_output_dir(config: dict[str, Any]) -> Path:
-    timezone_name = config.get("app", {}).get("timezone", "Asia/Shanghai")
+def output_dirs(config: dict[str, Any]) -> tuple[Path, Path, Path]:
     output_root = Path(config.get("app", {}).get("output_dir", "reports"))
-    output_dir = output_root / slug_date(timezone_name)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
+    markdown_dir = output_root / "markdown"
+    pdf_dir = output_root / "pdf"
+    html_dir = output_root / "html"
+    for directory in (markdown_dir, pdf_dir, html_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    return markdown_dir, pdf_dir, html_dir
 
 
 def markdown_to_html(markdown_text: str, title: str) -> str:
     body = markdown_lib.markdown(markdown_text, extensions=["tables", "fenced_code"])
+    escaped_title = html.escape(title)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>{title}</title>
+  <title>{escaped_title}</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.55; color: #17202a; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 12px; }}
-    th, td {{ border: 1px solid #d8dee9; padding: 6px 8px; vertical-align: top; }}
-    th {{ background: #f3f6f9; }}
-    h1, h2, h3 {{ color: #101820; }}
-    code, pre {{ white-space: pre-wrap; }}
+    @page {{ size: A4; margin: 12mm; }}
+    html, body {{ margin: 0; padding: 0; }}
+    body {{
+      font-family: "WenQuanYi Zen Hei", "WenQuanYi Micro Hei", "Noto Sans CJK SC",
+        "Noto Sans CJK", "DejaVu Sans", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 12px;
+      line-height: 1.58;
+      color: #17202a;
+      background: #ffffff;
+    }}
+    h1 {{ font-size: 24px; margin: 0 0 14px; color: #0f172a; }}
+    h2 {{ font-size: 18px; margin: 22px 0 10px; color: #111827; page-break-after: avoid; }}
+    h3 {{ font-size: 14px; margin: 16px 0 8px; color: #1f2937; page-break-after: avoid; }}
+    p, li {{ word-break: break-word; }}
+    table {{ border-collapse: collapse; width: 100%; margin: 10px 0 16px; font-size: 10px; page-break-inside: auto; }}
+    thead {{ display: table-header-group; }}
+    tr {{ page-break-inside: avoid; page-break-after: auto; }}
+    th, td {{ border: 1px solid #d8dee9; padding: 5px 6px; vertical-align: top; word-break: break-word; }}
+    th {{ background: #f3f6f9; font-weight: 700; }}
+    code, pre {{ white-space: pre-wrap; word-break: break-word; }}
+    a {{ color: #1d4ed8; text-decoration: none; }}
   </style>
 </head>
 <body>
@@ -84,136 +105,115 @@ def markdown_to_html(markdown_text: str, title: str) -> str:
 """
 
 
-def find_cjk_font(config: dict[str, Any]) -> str | None:
+def wkhtmltopdf_path(config: dict[str, Any]) -> str | None:
     configured = (
-        os.getenv("REPORT_FONT_PATH")
-        or config.get("report", {}).get("pdf", {}).get("font_path")
+        os.getenv("PDF_WKHTMLTOPDF_PATH")
+        or config.get("report", {}).get("pdf", {}).get("wkhtmltopdf_path")
         or ""
     )
-    candidates = [
-        configured,
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simsun.ttc",
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+    if configured and Path(configured).exists():
+        return configured
+    return shutil.which("wkhtmltopdf")
+
+
+def validate_pdf(pdf_path: Path, config: dict[str, Any]) -> tuple[bool, str]:
+    min_bytes = env_int("PDF_MIN_BYTES", int(config.get("report", {}).get("pdf", {}).get("min_bytes", 5000)))
+    if not pdf_path.exists():
+        return False, f"PDF 文件不存在: {pdf_path}"
+    size = pdf_path.stat().st_size
+    if size < min_bytes:
+        return False, f"PDF 文件过小: {size} bytes，低于阈值 {min_bytes} bytes"
+    with pdf_path.open("rb") as file:
+        header = file.read(4)
+    if header != b"%PDF":
+        return False, f"PDF 文件头异常: {header!r}"
+    return True, f"PDF 校验通过: {size} bytes"
+
+
+def render_pdf_with_wkhtmltopdf(html_path: Path, pdf_path: Path, config: dict[str, Any]) -> tuple[bool, str]:
+    executable = wkhtmltopdf_path(config)
+    if not executable:
+        return False, "未找到 wkhtmltopdf"
+
+    command = [
+        executable,
+        "--encoding",
+        "utf-8",
+        "--enable-local-file-access",
+        "--print-media-type",
+        "--page-size",
+        "A4",
+        "--margin-top",
+        "12mm",
+        "--margin-bottom",
+        "12mm",
+        "--margin-left",
+        "12mm",
+        "--margin-right",
+        "12mm",
+        str(html_path.resolve()),
+        str(pdf_path.resolve()),
     ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return candidate
-    return None
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return False, f"wkhtmltopdf 失败，exit={completed.returncode}: {detail}"
+    return True, "wkhtmltopdf 转换完成"
 
 
-def register_pdf_font(config: dict[str, Any]) -> tuple[str, str | None]:
-    font_path = find_cjk_font(config)
-    if not font_path:
-        return "Helvetica", "未找到中文字体，PDF 中文可能无法正确显示；可在 .env 设置 REPORT_FONT_PATH。"
+def render_pdf_with_playwright(html_path: Path, pdf_path: Path) -> tuple[bool, str]:
     try:
-        pdfmetrics.registerFont(TTFont("CJKFont", font_path))
-        return "CJKFont", None
-    except Exception as exc:  # noqa: BLE001 - PDF should not block Markdown output.
-        return "Helvetica", f"中文字体注册失败: {exc}"
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Playwright 不可用: {exc}"
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto(html_path.resolve().as_uri(), wait_until="networkidle")
+            page.pdf(
+                path=str(pdf_path.resolve()),
+                format="A4",
+                print_background=True,
+                margin={"top": "12mm", "bottom": "12mm", "left": "12mm", "right": "12mm"},
+            )
+            browser.close()
+        return True, "Playwright/Chromium 转换完成"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Playwright/Chromium 失败: {exc}"
 
 
-def is_markdown_table_line(line: str) -> bool:
-    stripped = line.strip()
-    return stripped.startswith("|") and stripped.endswith("|")
+def render_pdf_from_html(html_path: Path, pdf_path: Path, config: dict[str, Any]) -> str | None:
+    attempts: list[str] = []
+    ok, detail = render_pdf_with_wkhtmltopdf(html_path, pdf_path, config)
+    attempts.append(detail)
+    if not ok:
+        ok, detail = render_pdf_with_playwright(html_path, pdf_path)
+        attempts.append(detail)
 
+    if not ok:
+        return "PDF 生成失败: " + "；".join(attempts)
 
-def flush_table(table_lines: list[str], story: list[Any], style: ParagraphStyle) -> None:
-    if not table_lines:
-        return
-    table_text = "\n".join(table_lines)
-    wrapped = []
-    for line in table_text.splitlines():
-        wrapped.append("\n".join(textwrap.wrap(line, width=110, replace_whitespace=False)) or line)
-    story.append(Preformatted(escape("\n".join(wrapped)), style))
-    story.append(Spacer(1, 4 * mm))
-    table_lines.clear()
+    valid, validation_detail = validate_pdf(pdf_path, config)
+    if valid:
+        return None
 
-
-def render_basic_pdf(markdown_text: str, pdf_path: Path, config: dict[str, Any]) -> str | None:
-    font_name, warning = register_pdf_font(config)
-    styles = getSampleStyleSheet()
-    normal = ParagraphStyle(
-        "NormalCJK",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=9,
-        leading=14,
-        textColor=colors.HexColor("#17202a"),
-        spaceAfter=4,
-    )
-    h1 = ParagraphStyle("H1CJK", parent=normal, fontSize=18, leading=24, spaceBefore=6, spaceAfter=10)
-    h2 = ParagraphStyle("H2CJK", parent=normal, fontSize=14, leading=20, spaceBefore=10, spaceAfter=6)
-    h3 = ParagraphStyle("H3CJK", parent=normal, fontSize=11, leading=16, spaceBefore=8, spaceAfter=4)
-    table_style = ParagraphStyle(
-        "TableText",
-        parent=normal,
-        fontName=font_name,
-        fontSize=6.5,
-        leading=8.5,
-        backColor=colors.HexColor("#f8fafc"),
-        borderColor=colors.HexColor("#d8dee9"),
-        borderWidth=0.25,
-        borderPadding=4,
-    )
-
-    doc = SimpleDocTemplate(
-        str(pdf_path),
-        pagesize=A4,
-        rightMargin=12 * mm,
-        leftMargin=12 * mm,
-        topMargin=14 * mm,
-        bottomMargin=14 * mm,
-        title=config.get("report", {}).get("title", "us-market-review"),
-    )
-    story: list[Any] = []
-    table_lines: list[str] = []
-
-    for raw_line in markdown_text.splitlines():
-        line = raw_line.rstrip()
-        if is_markdown_table_line(line):
-            table_lines.append(line)
-            continue
-
-        flush_table(table_lines, story, table_style)
-
-        if not line:
-            story.append(Spacer(1, 2 * mm))
-            continue
-        if line.startswith("# "):
-            story.append(Paragraph(escape(line[2:].strip()), h1))
-            continue
-        if line.startswith("## "):
-            if story:
-                story.append(Spacer(1, 2 * mm))
-            story.append(Paragraph(escape(line[3:].strip()), h2))
-            continue
-        if line.startswith("### "):
-            story.append(Paragraph(escape(line[4:].strip()), h3))
-            continue
-        if line == "\\pagebreak":
-            story.append(PageBreak())
-            continue
-
-        html_line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
-        story.append(Paragraph(escape(html_line), normal))
-
-    flush_table(table_lines, story, table_style)
-    doc.build(story)
-    return warning
+    try:
+        pdf_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return f"PDF 生成失败: {validation_detail}。已删除异常 PDF，不会推送坏 PDF。"
 
 
 def write_outputs(config: dict[str, Any], markdown_text: str) -> tuple[Path, Path | None, list[str]]:
-    output_dir = ensure_output_dir(config)
-    report_date = output_dir.name
+    markdown_dir, pdf_dir, html_dir = output_dirs(config)
+    timezone_name = config.get("app", {}).get("timezone", "Asia/Shanghai")
+    report_date = slug_date(timezone_name)
     base_name = f"us-market-review-{report_date}"
-    markdown_path = output_dir / f"{base_name}.md"
-    html_path = output_dir / f"{base_name}.html"
-    pdf_path = output_dir / f"{base_name}.pdf"
+    markdown_path = markdown_dir / f"{base_name}.md"
+    html_path = html_dir / f"{base_name}.html"
+    pdf_path = pdf_dir / f"{base_name}.pdf"
     warnings: list[str] = []
 
     markdown_path.write_text(markdown_text, encoding="utf-8")
@@ -221,12 +221,9 @@ def write_outputs(config: dict[str, Any], markdown_text: str) -> tuple[Path, Pat
 
     pdf_enabled = config.get("report", {}).get("pdf", {}).get("enabled", True)
     if pdf_enabled:
-        try:
-            warning = render_basic_pdf(markdown_text, pdf_path, config)
-            if warning:
-                warnings.append(warning)
-        except Exception as exc:  # noqa: BLE001 - Markdown is the source of truth for MVP.
-            warnings.append(f"PDF 生成失败: {exc}. 已保留 Markdown 和 HTML。")
+        warning = render_pdf_from_html(html_path, pdf_path, config)
+        if warning:
+            warnings.append(warning)
             pdf_path = None
     else:
         pdf_path = None
@@ -235,14 +232,60 @@ def write_outputs(config: dict[str, Any], markdown_text: str) -> tuple[Path, Pat
 
 
 def market_fetch_summary(market_data: dict[str, Any]) -> str:
-    assets = market_data.get("assets", [])
-    failed = [asset for asset in assets if asset.get("error")]
-    return f"行情 {len(assets) - len(failed)}/{len(assets)} 成功，失败 {len(failed)} 个"
+    metadata = market_data.get("metadata", {})
+    return (
+        f"行情成功 {metadata.get('success_count', 0)}/{metadata.get('total_count', 0)}，"
+        f"实时 {metadata.get('live_success_count', 0)}，"
+        f"缓存 {metadata.get('cache_success_count', 0)}，"
+        f"失败 {metadata.get('failed_count', 0)}"
+    )
 
 
 def news_fetch_summary(news_data: dict[str, Any]) -> str:
     errors = news_data.get("errors", [])
     return f"新闻 {len(news_data.get('items', []))} 条，RSS 失败 {len(errors)} 个"
+
+
+def market_status_markdown(market_data: dict[str, Any]) -> str:
+    metadata = market_data.get("metadata", {})
+    total = int(metadata.get("total_count") or len(market_data.get("assets", [])))
+    success = int(metadata.get("success_count") or 0)
+    live_success = int(metadata.get("live_success_count") or 0)
+    cache_success = int(metadata.get("cache_success_count") or 0)
+    failed = int(metadata.get("failed_count") or max(total - success, 0))
+    success_ratio = float(metadata.get("success_ratio") or 0.0)
+    live_success_ratio = float(metadata.get("live_success_ratio") or 0.0)
+    min_success_ratio = float(metadata.get("min_success_ratio") or 0.7)
+    warnings = metadata.get("warnings", [])
+
+    lines = [
+        "## 数据状态",
+        "",
+        f"- 行情成功数量: {success}/{total}，其中实时获取 {live_success}，缓存降级 {cache_success}",
+        f"- 行情失败数量: {failed}",
+        f"- 行情可用率: {success_ratio * 100:.1f}%；实时获取率: {live_success_ratio * 100:.1f}%；最低要求: {min_success_ratio * 100:.1f}%",
+        f"- 数据源: {metadata.get('source', 'N/A')}",
+        f"- 数据获取时间: {metadata.get('fetched_at', 'N/A')}",
+    ]
+    if warnings:
+        lines.append(f"- 警告: {'；'.join(str(item) for item in warnings)}")
+    if failed:
+        lines.append("- 说明: 本报告不会补写缺失行情；缺失项在后续表格中显示为 N/A 或进入抓取异常。")
+    return "\n".join(lines)
+
+
+def ensure_market_status_section(markdown_text: str, market_data: dict[str, Any]) -> str:
+    if "## 数据状态" in markdown_text:
+        return markdown_text
+    lines = markdown_text.splitlines()
+    if not lines:
+        return market_status_markdown(market_data) + "\n"
+
+    insert_at = 1
+    while insert_at < len(lines) and lines[insert_at].strip():
+        insert_at += 1
+    status_lines = ["", market_status_markdown(market_data), ""]
+    return "\n".join(lines[:insert_at] + status_lines + lines[insert_at:]).strip() + "\n"
 
 
 def log_push_results(logger: logging.Logger, results: list[PushResult]) -> None:
@@ -256,6 +299,18 @@ def log_push_results(logger: logging.Logger, results: list[PushResult]) -> None:
         logger.info("推送结果: channel=%s status=%s detail=%s", result.channel, status, result.detail)
 
 
+def push_alerts_from_run(market_data: dict[str, Any], warnings: list[str]) -> list[str]:
+    alerts: list[str] = []
+    metadata = market_data.get("metadata", {})
+    for warning in metadata.get("warnings", []):
+        if warning not in alerts:
+            alerts.append(str(warning))
+    for warning in warnings:
+        if warning not in alerts:
+            alerts.append(warning)
+    return alerts
+
+
 def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[Path, Path | None, list[str], list[PushResult]]:
     logger = logger or setup_logger()
     logger.info("开始时间: %s", datetime.now().astimezone().isoformat(timespec="seconds"))
@@ -265,26 +320,28 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
 
     market_data = fetch_market_data(config)
     logger.info("数据获取结果: %s", market_fetch_summary(market_data))
+    for warning in market_data.get("metadata", {}).get("warnings", []):
+        logger.warning("行情质量警告: %s", warning)
     for asset in market_data.get("assets", []):
         if asset.get("error"):
-            logger.warning("行情失败: ticker=%s reason=%s", asset.get("ticker"), asset.get("error"))
+            logger.warning("行情失败或降级: ticker=%s from_cache=%s reason=%s", asset.get("ticker"), asset.get("from_cache"), asset.get("error"))
 
     news_data = fetch_news(config)
     logger.info("数据获取结果: %s", news_fetch_summary(news_data))
     for error in news_data.get("errors", []):
         logger.warning("新闻失败: source=%s reason=%s", error.get("source"), error.get("error"))
 
-    markdown_text = build_markdown_report(config, market_data, news_data)
+    markdown_text = ensure_market_status_section(build_markdown_report(config, market_data, news_data), market_data)
     markdown_path, pdf_path, warnings = write_outputs(config, markdown_text)
     logger.info("报告生成路径: markdown=%s", markdown_path)
     if pdf_path:
         logger.info("报告生成路径: pdf=%s", pdf_path)
     else:
-        logger.warning("报告生成路径: pdf=未生成")
+        logger.warning("报告生成路径: pdf=未生成或校验失败")
     for warning in warnings:
         logger.warning("报告生成警告: %s", warning)
 
-    push_results = send_outputs(markdown_path, pdf_path)
+    push_results = send_outputs(markdown_path, pdf_path, alerts=push_alerts_from_run(market_data, warnings))
     log_push_results(logger, push_results)
     logger.info("运行结束: success")
     return markdown_path, pdf_path, warnings, push_results
