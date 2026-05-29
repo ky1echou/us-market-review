@@ -9,10 +9,15 @@
 - 配置：`.env` 与 `config.yaml`
 - 日志：`logs/daily.log`
 
-项目不会编造关键数字。价格、涨跌幅、MA5/MA20 偏离、RSI 等关键数据均来自行情源；新闻只作为催化验证，不替代行情数据。若实时行情成功率低于 70%，系统不会生成正式 PDF，只会推送：
+项目不会编造关键数字。若实时行情成功率低于 70%，系统不会生成正式 Markdown/PDF，只会推送状态消息：
 
 ```text
-今日行情数据抓取失败，未生成正式美股复盘，请检查数据源。
+今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。
+行情成功数量: x/y
+行情失败数量: z
+行情成功率: xx.x%
+数据源: ...
+获取时间: ...
 ```
 
 ## 一键安装
@@ -21,8 +26,6 @@
 cd /opt/us-market-review
 bash scripts/install_ubuntu.sh
 ```
-
-安装脚本会自动安装 Python、虚拟环境、依赖、`wkhtmltopdf` 和中文字体，并创建 `logs/`、`reports/`、`data/` 等目录。如果没有 `.env`，会从 `.env.example` 复制一份。
 
 ## 配置推送
 
@@ -50,7 +53,7 @@ FEISHU_SECRET=
 
 ## 行情源配置
 
-默认配置已足够运行：
+默认配置：
 
 ```env
 MARKET_PROVIDER_CHAIN=yfinance,stooq
@@ -60,11 +63,10 @@ MARKET_RETRY_BACKOFF_SEC=4.0
 MARKET_CACHE_DIR=data/processed/market_cache
 MARKET_CACHE_MAX_AGE_HOURS=168
 MARKET_MIN_SUCCESS_RATIO=0.7
+RUN_DAILY_TIMEOUT=20m
 ```
 
-含义：先尝试 yfinance；如果遇到 Yahoo 限流或空数据，自动尝试 Stooq；两者都失败时才读取本地缓存。缓存可帮助排查，但实时行情成功率低于 70% 时仍会停止正式报告生成，避免出现整页 N/A 或 Too Many Requests 正文。
-
-后续可在 `src/market_data_provider.py` 中继续接入 Twelve Data、Alpha Vantage、Polygon。
+含义：先尝试 yfinance；如果遇到 Yahoo 限流或空数据，自动尝试 Stooq；两者都失败时才读取本地缓存。Stooq 指数代码可在 `config.yaml` 的 `market.provider_options.stooq.symbol_map` 中维护。
 
 ## 手动测试
 
@@ -72,32 +74,54 @@ MARKET_MIN_SUCCESS_RATIO=0.7
 cd /opt/us-market-review
 source .venv/bin/activate
 python test_send.py
+python -m src.health_check --config config.yaml
 bash run_daily.sh
 tail -n 120 logs/daily.log
 ```
 
-正常情况下会生成：
-
-```text
-reports/markdown/us-market-review-YYYY-MM-DD.md
-reports/pdf/us-market-review-YYYY-MM-DD.pdf
-reports/html/us-market-review-YYYY-MM-DD.html
-```
-
-若行情失败，只会推送失败提示，不生成正式 PDF。
+若行情失败，只会推送失败提示，不生成正式 Markdown/PDF。
 
 ## 定时运行
 
-```bash
-crontab -e
-```
-
-加入：
+正式日报由服务器 cron 执行，北京时间每周二到周六 7:30：
 
 ```cron
 CRON_TZ=Asia/Shanghai
 30 7 * * 2-6 cd /opt/us-market-review && bash run_daily.sh >> logs/daily.log 2>&1
 ```
+
+`run_daily.sh` 内置 20 分钟超时和锁保护。如果已有任务在运行，本次触发会跳过，并向 Telegram 发送：
+
+```text
+us-market-review 正在运行，已跳过本次触发。
+```
+
+## 自动部署
+
+`main` 有新提交后，GitHub Actions 只做部署和轻量健康检查：
+
+- 保留服务器上的 `.env`
+- `git fetch` / `git reset --hard origin/main`
+- `bash scripts/install_ubuntu.sh`
+- `python -m src.health_check --config config.yaml`
+
+默认不会运行 `bash run_daily.sh`，避免每次 push 都抓行情、加重限流。
+
+如需手动从 GitHub Actions 跑一次正式日报：
+
+1. 打开 Actions → Deploy to Ubuntu Server
+2. 点击 `Run workflow`
+3. 将 `run_report` 设为 `true`
+
+需要配置 GitHub Repository Secrets：
+
+```text
+SERVER_HOST
+SERVER_USER
+SERVER_SSH_KEY
+```
+
+workflow 已设置并发保护：同一分支新的部署会取消旧部署。
 
 ## PDF 排查
 
@@ -110,18 +134,6 @@ fc-list | grep -E "WenQuanYi|Noto Sans CJK|DejaVu" | head
 bash scripts/install_ubuntu.sh
 bash run_daily.sh
 tail -n 200 logs/daily.log
-```
-
-## 自动部署
-
-仓库包含 `.github/workflows/deploy.yml`。`main` 有新提交后，GitHub Actions 会 SSH 到服务器，保留 `.env`，拉取最新代码，运行安装脚本，再执行一次 `bash run_daily.sh` 验证。
-
-需要配置 GitHub Repository Secrets：
-
-```text
-SERVER_HOST
-SERVER_USER
-SERVER_SSH_KEY
 ```
 
 ## 文件结构
@@ -140,6 +152,7 @@ us-market-review/
   src/
     fetch_market.py
     market_data_provider.py
+    health_check.py
     indicators.py
     fetch_news.py
     prompt_builder.py
