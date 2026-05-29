@@ -17,7 +17,17 @@ from dotenv import load_dotenv
 from .fetch_market import fetch_market_data, load_config
 from .fetch_news import fetch_news
 from .prompt_builder import build_markdown_report
-from .send_report import PushResult, send_outputs
+from .send_report import (
+    PushResult,
+    feishu_enabled,
+    send_feishu_message,
+    send_outputs,
+    send_telegram_message,
+    telegram_enabled,
+)
+
+
+MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败，未生成正式美股复盘，请检查数据源。"
 
 
 def slug_date(timezone_name: str) -> str:
@@ -246,48 +256,6 @@ def news_fetch_summary(news_data: dict[str, Any]) -> str:
     return f"新闻 {len(news_data.get('items', []))} 条，RSS 失败 {len(errors)} 个"
 
 
-def market_status_markdown(market_data: dict[str, Any]) -> str:
-    metadata = market_data.get("metadata", {})
-    total = int(metadata.get("total_count") or len(market_data.get("assets", [])))
-    success = int(metadata.get("success_count") or 0)
-    live_success = int(metadata.get("live_success_count") or 0)
-    cache_success = int(metadata.get("cache_success_count") or 0)
-    failed = int(metadata.get("failed_count") or max(total - success, 0))
-    success_ratio = float(metadata.get("success_ratio") or 0.0)
-    live_success_ratio = float(metadata.get("live_success_ratio") or 0.0)
-    min_success_ratio = float(metadata.get("min_success_ratio") or 0.7)
-    warnings = metadata.get("warnings", [])
-
-    lines = [
-        "## 数据状态",
-        "",
-        f"- 行情成功数量: {success}/{total}，其中实时获取 {live_success}，缓存降级 {cache_success}",
-        f"- 行情失败数量: {failed}",
-        f"- 行情可用率: {success_ratio * 100:.1f}%；实时获取率: {live_success_ratio * 100:.1f}%；最低要求: {min_success_ratio * 100:.1f}%",
-        f"- 数据源: {metadata.get('source', 'N/A')}",
-        f"- 数据获取时间: {metadata.get('fetched_at', 'N/A')}",
-    ]
-    if warnings:
-        lines.append(f"- 警告: {'；'.join(str(item) for item in warnings)}")
-    if failed:
-        lines.append("- 说明: 本报告不会补写缺失行情；缺失项在后续表格中显示为 N/A 或进入抓取异常。")
-    return "\n".join(lines)
-
-
-def ensure_market_status_section(markdown_text: str, market_data: dict[str, Any]) -> str:
-    if "## 数据状态" in markdown_text:
-        return markdown_text
-    lines = markdown_text.splitlines()
-    if not lines:
-        return market_status_markdown(market_data) + "\n"
-
-    insert_at = 1
-    while insert_at < len(lines) and lines[insert_at].strip():
-        insert_at += 1
-    status_lines = ["", market_status_markdown(market_data), ""]
-    return "\n".join(lines[:insert_at] + status_lines + lines[insert_at:]).strip() + "\n"
-
-
 def log_push_results(logger: logging.Logger, results: list[PushResult]) -> None:
     for result in results:
         if result.success:
@@ -299,19 +267,34 @@ def log_push_results(logger: logging.Logger, results: list[PushResult]) -> None:
         logger.info("推送结果: channel=%s status=%s detail=%s", result.channel, status, result.detail)
 
 
-def push_alerts_from_run(market_data: dict[str, Any], warnings: list[str]) -> list[str]:
+def push_alerts_from_run(warnings: list[str]) -> list[str]:
     alerts: list[str] = []
-    metadata = market_data.get("metadata", {})
-    for warning in metadata.get("warnings", []):
-        if warning not in alerts:
-            alerts.append(str(warning))
     for warning in warnings:
         if warning not in alerts:
             alerts.append(warning)
     return alerts
 
 
-def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[Path, Path | None, list[str], list[PushResult]]:
+def send_market_failure_alert() -> list[PushResult]:
+    results: list[PushResult] = []
+    if telegram_enabled():
+        results.append(send_telegram_message(MARKET_FAILURE_MESSAGE))
+    else:
+        results.append(PushResult("telegram", False, False, "disabled"))
+
+    if feishu_enabled():
+        results.append(send_feishu_message(MARKET_FAILURE_MESSAGE))
+    else:
+        results.append(PushResult("feishu", False, False, "disabled"))
+    return results
+
+
+def formal_report_allowed(market_data: dict[str, Any]) -> bool:
+    metadata = market_data.get("metadata", {})
+    return bool(metadata.get("formal_report_allowed", metadata.get("live_data_complete", False)))
+
+
+def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[Path | None, Path | None, list[str], list[PushResult]]:
     logger = logger or setup_logger()
     logger.info("开始时间: %s", datetime.now().astimezone().isoformat(timespec="seconds"))
 
@@ -324,14 +307,21 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
         logger.warning("行情质量警告: %s", warning)
     for asset in market_data.get("assets", []):
         if asset.get("error"):
-            logger.warning("行情失败或降级: ticker=%s from_cache=%s reason=%s", asset.get("ticker"), asset.get("from_cache"), asset.get("error"))
+            logger.warning("行情失败或降级: ticker=%s from_cache=%s provider=%s reason=%s", asset.get("ticker"), asset.get("from_cache"), asset.get("source", {}).get("provider"), asset.get("error"))
+
+    if not formal_report_allowed(market_data):
+        logger.error("失败原因: %s %s", MARKET_FAILURE_MESSAGE, market_fetch_summary(market_data))
+        push_results = send_market_failure_alert()
+        log_push_results(logger, push_results)
+        logger.info("运行结束: market_data_failed_no_formal_report")
+        return None, None, [MARKET_FAILURE_MESSAGE], push_results
 
     news_data = fetch_news(config)
     logger.info("数据获取结果: %s", news_fetch_summary(news_data))
     for error in news_data.get("errors", []):
         logger.warning("新闻失败: source=%s reason=%s", error.get("source"), error.get("error"))
 
-    markdown_text = ensure_market_status_section(build_markdown_report(config, market_data, news_data), market_data)
+    markdown_text = build_markdown_report(config, market_data, news_data)
     markdown_path, pdf_path, warnings = write_outputs(config, markdown_text)
     logger.info("报告生成路径: markdown=%s", markdown_path)
     if pdf_path:
@@ -341,7 +331,7 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
     for warning in warnings:
         logger.warning("报告生成警告: %s", warning)
 
-    push_results = send_outputs(markdown_path, pdf_path, alerts=push_alerts_from_run(market_data, warnings))
+    push_results = send_outputs(markdown_path, pdf_path, alerts=push_alerts_from_run(warnings))
     log_push_results(logger, push_results)
     logger.info("运行结束: success")
     return markdown_path, pdf_path, warnings, push_results
@@ -359,7 +349,8 @@ def main() -> None:
         logger.exception("失败原因: %s", exc)
         raise
 
-    print(f"Markdown report: {markdown_path}")
+    if markdown_path:
+        print(f"Markdown report: {markdown_path}")
     if pdf_path:
         print(f"PDF report: {pdf_path}")
     for warning in warnings:
