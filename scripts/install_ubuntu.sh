@@ -24,14 +24,16 @@ echo "[2/10] Updating apt..."
 sudo apt update
 
 echo "[3/10] Installing system packages..."
-sudo apt install -y git python3 python3-venv python3-pip fonts-noto-cjk curl
+sudo apt install -y git python3 python3-venv python3-pip curl wkhtmltopdf fonts-wqy-zenhei fonts-wqy-microhei fonts-noto-cjk
 
 echo "[4/10] Creating required directories..."
 mkdir -p logs
 mkdir -p reports/markdown
 mkdir -p reports/pdf
+mkdir -p reports/html
 mkdir -p data/raw
 mkdir -p data/processed
+mkdir -p data/processed/market_cache
 
 echo "[5/10] Creating Python virtual environment..."
 if [ ! -d ".venv" ]; then
@@ -101,15 +103,11 @@ echo "5. After manual run succeeds, set cron:"
 echo ""
 echo "   crontab -e"
 echo ""
-echo "   Add this line:"
+echo "   Add these lines:"
 echo ""
+echo "   CRON_TZ=Asia/Shanghai"
 echo "   30 7 * * 2-6 cd $PROJECT_DIR && bash run_daily.sh >> logs/daily.log 2>&1"
 echo ""
-echo "This means: run every Tuesday to Saturday at 07:30 server time."
-echo "Recommended timezone: Asia/Shanghai"
-echo ""
-echo "To set timezone:"
-echo ""
-echo "   sudo timedatectl set-timezone Asia/Shanghai"
+echo "This means: run every Tuesday to Saturday at 07:30 Beijing time."
 echo ""
 echo "======================================"
