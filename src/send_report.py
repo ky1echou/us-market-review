@@ -46,13 +46,17 @@ def truncate(text: str, limit: int = 1000) -> str:
     return text[: limit - 3] + "..."
 
 
-def report_message(markdown_path: Path, pdf_path: Path | None = None) -> str:
+def report_message(markdown_path: Path, pdf_path: Path | None = None, alerts: list[str] | None = None) -> str:
     lines = [
         "美股复盘报告已生成",
         f"Markdown: {markdown_path}",
     ]
     if pdf_path and pdf_path.exists():
         lines.append(f"PDF: {pdf_path}")
+    else:
+        lines.append("PDF 生成失败，仅发送 Markdown。")
+    for alert in alerts or []:
+        lines.append(f"提醒: {alert}")
     return "\n".join(lines)
 
 
@@ -224,11 +228,11 @@ def send_feishu_message(text: str) -> PushResult:
         return PushResult(channel, True, False, str(exc))
 
 
-def send_outputs(markdown_path: Path, pdf_path: Path | None = None) -> list[PushResult]:
+def send_outputs(markdown_path: Path, pdf_path: Path | None = None, alerts: list[str] | None = None) -> list[PushResult]:
     load_dotenv()
     prefix = os.getenv("EMAIL_SUBJECT_PREFIX", "美股复盘")
     subject = f"{prefix} - {markdown_path.stem}"
-    message = report_message(markdown_path, pdf_path)
+    message = report_message(markdown_path, pdf_path, alerts=alerts)
     results: list[PushResult] = []
 
     if telegram_enabled():
