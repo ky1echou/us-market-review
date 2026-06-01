@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from io import StringIO
 from typing import Any, Protocol
@@ -50,6 +51,172 @@ def period_to_days(period: str) -> int | None:
     except ValueError:
         return None
     return None
+
+
+class FMPProvider:
+    name = "Financial Modeling Prep"
+    base_url = "https://financialmodelingprep.com/api/v3"
+    default_symbol_map = {
+        "^GSPC": "SPY",
+        "^SPX": "SPY",
+        "^IXIC": "QQQ",
+        "^NDX": "QQQ",
+        "^DJI": "DIA",
+        "^RUT": "IWM",
+        "^SOX": "SMH",
+        "SPY": "SPY",
+        "QQQ": "QQQ",
+        "DIA": "DIA",
+        "IWM": "IWM",
+        "SMH": "SMH",
+        "SOXX": "SOXX",
+        "XLK": "XLK",
+        "XLE": "XLE",
+        "XLF": "XLF",
+        "XLV": "XLV",
+        "TLT": "TLT",
+        "GLD": "GLD",
+        "USO": "USO",
+        "NVDA": "NVDA",
+        "AMD": "AMD",
+        "AVGO": "AVGO",
+        "MSFT": "MSFT",
+        "GOOGL": "GOOGL",
+        "META": "META",
+        "AMZN": "AMZN",
+        "AAPL": "AAPL",
+        "TSLA": "TSLA",
+        "MU": "MU",
+        "MRVL": "MRVL",
+        "ARM": "ARM",
+        "SNOW": "SNOW",
+        "NOW": "NOW",
+    }
+
+    def __init__(
+        self,
+        symbol_map: dict[str, str] | None = None,
+        api_key: str | None = None,
+        api_key_env: str = "FMP_API_KEY",
+        quote_batch_size: int = 80,
+        timeout: int = 20,
+    ) -> None:
+        self.symbol_map = {**self.default_symbol_map, **(symbol_map or {})}
+        self.api_key_env = api_key_env or "FMP_API_KEY"
+        self.api_key = (api_key or os.getenv(self.api_key_env, "")).strip()
+        self.quote_batch_size = max(1, int(quote_batch_size or 80))
+        self.timeout = int(timeout or 20)
+        self.session = requests.Session()
+        self.quote_cache: dict[str, dict[str, Any]] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    @classmethod
+    def is_configured(cls, options: dict[str, Any] | None = None) -> bool:
+        options = options or {}
+        api_key_env = str(options.get("api_key_env") or "FMP_API_KEY")
+        return bool(str(options.get("api_key") or os.getenv(api_key_env, "")).strip())
+
+    def fmp_symbol(self, ticker: str) -> str:
+        if ticker in self.symbol_map:
+            return self.symbol_map[ticker]
+        cleaned = ticker.strip().replace("-", ".").upper()
+        return self.symbol_map.get(cleaned, cleaned)
+
+    def _request_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        if not self.enabled:
+            raise ValueError("FMP provider disabled: FMP_API_KEY is not configured")
+
+        request_params = {**(params or {}), "apikey": self.api_key}
+        response = self.session.get(
+            f"{self.base_url}/{path.lstrip('/')}",
+            params=request_params,
+            headers={"User-Agent": "us-market-review/0.1"},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ValueError("invalid FMP JSON response") from exc
+
+        if isinstance(payload, dict):
+            message = payload.get("Error Message") or payload.get("error") or payload.get("message")
+            if message:
+                raise ValueError(f"FMP API error: {message}")
+        return payload
+
+    def prefetch_quotes(self, tickers: list[str]) -> dict[str, dict[str, Any]]:
+        if not self.enabled:
+            return {}
+
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for ticker in tickers:
+            symbol = self.fmp_symbol(ticker)
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                symbols.append(symbol)
+
+        for start in range(0, len(symbols), self.quote_batch_size):
+            chunk = symbols[start : start + self.quote_batch_size]
+            if not chunk:
+                continue
+            payload = self._request_json(f"quote/{','.join(chunk)}")
+            if not isinstance(payload, list):
+                raise ValueError("invalid FMP quote response")
+            for row in payload:
+                if isinstance(row, dict) and row.get("symbol"):
+                    self.quote_cache[str(row["symbol"]).upper()] = row
+        return self.quote_cache
+
+    def _timeseries_count(self, period: str) -> int:
+        days = period_to_days(period)
+        if days is None:
+            return 365
+        return max(30, min(days + 25, 1500))
+
+    def fetch_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
+        if interval not in {"1d", "1D", "d", "D"}:
+            raise ValueError("FMP provider only supports daily history")
+
+        symbol = self.fmp_symbol(ticker)
+        payload = self._request_json(
+            f"historical-price-full/{symbol}",
+            params={"timeseries": self._timeseries_count(period)},
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("historical"), list):
+            raise ValueError("invalid FMP historical response")
+
+        frame = pd.DataFrame(payload["historical"])
+        if frame.empty or "date" not in frame.columns or "close" not in frame.columns:
+            raise ValueError("empty FMP historical response")
+
+        frame = frame.rename(
+            columns={
+                "date": "Date",
+                "open": "Open",
+                "high": "High",
+                "low": "Low",
+                "close": "Close",
+                "adjClose": "Adj Close",
+                "volume": "Volume",
+            }
+        )
+        keep_columns = [column for column in ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"] if column in frame.columns]
+        frame = frame[keep_columns].copy()
+        for column in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+            if column in frame.columns:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+        frame = normalize_history_frame(frame)
+        days = period_to_days(period)
+        if days:
+            cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days + 5)
+            frame = frame[frame.index >= cutoff]
+        return frame
 
 
 class YFinanceProvider:
@@ -145,6 +312,15 @@ class StooqProvider:
 def make_provider(name: str, options: dict[str, Any] | None = None) -> MarketDataProvider:
     normalized = name.strip().lower()
     options = options or {}
+    if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
+        symbol_map = options.get("symbol_map") if isinstance(options, dict) else None
+        return FMPProvider(
+            symbol_map=symbol_map if isinstance(symbol_map, dict) else None,
+            api_key=options.get("api_key") if isinstance(options, dict) else None,
+            api_key_env=str(options.get("api_key_env") or "FMP_API_KEY"),
+            quote_batch_size=int(options.get("quote_batch_size") or 80),
+            timeout=int(options.get("timeout") or 20),
+        )
     if normalized == "yfinance":
         return YFinanceProvider()
     if normalized == "stooq":
@@ -160,8 +336,18 @@ def make_provider(name: str, options: dict[str, Any] | None = None) -> MarketDat
     raise ValueError(f"Unsupported market provider: {name}")
 
 
+def provider_is_enabled(name: str, options: dict[str, Any] | None = None) -> bool:
+    normalized = name.strip().lower()
+    options = options or {}
+    if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
+        return FMPProvider.is_configured(options)
+    return True
+
+
 def provider_display_name(name: str) -> str:
     normalized = name.strip().lower()
+    if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
+        return FMPProvider.name
     if normalized in {"cache", "local_cache", "local market cache"}:
         return "Local market cache"
     return make_provider(name).name
@@ -170,6 +356,12 @@ def provider_display_name(name: str) -> str:
 def resolve_provider_symbol(name: str, ticker: str, options: dict[str, Any] | None = None) -> str:
     normalized = name.strip().lower()
     options = options or {}
+    if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
+        provider = FMPProvider(
+            symbol_map=options.get("symbol_map") if isinstance(options.get("symbol_map"), dict) else None,
+            api_key_env=str(options.get("api_key_env") or "FMP_API_KEY"),
+        )
+        return provider.fmp_symbol(ticker)
     if normalized == "stooq":
         provider = make_provider("stooq", options)
         if isinstance(provider, StooqProvider):
