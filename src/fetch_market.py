@@ -14,10 +14,10 @@ import yaml
 from dotenv import load_dotenv
 
 from .indicators import summarize_price_frame
-from .market_data_provider import make_provider, provider_display_name
+from .market_data_provider import make_provider, provider_display_name, provider_is_enabled
 
 
-DEFAULT_PROVIDER_ORDER = ["stooq", "yfinance", "cache"]
+DEFAULT_PROVIDER_ORDER = ["fmp", "stooq", "yfinance", "cache"]
 MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。"
 
 
@@ -44,6 +44,8 @@ def env_int(name: str, default: int) -> int:
 def normalize_provider_name(name: str) -> str:
     normalized = str(name).strip().lower()
     aliases = {
+        "financial_modeling_prep": "fmp",
+        "financialmodelingprep": "fmp",
         "local_cache": "cache",
         "local market cache": "cache",
         "twelvedata": "twelve_data",
@@ -80,6 +82,26 @@ def configured_provider_order(market: dict[str, Any]) -> list[str]:
     )
 
 
+def provider_options_for(provider_options: dict[str, Any], provider_name: str) -> dict[str, Any]:
+    value = provider_options.get(provider_name) or provider_options.get(provider_name.lower()) or {}
+    return value if isinstance(value, dict) else {}
+
+
+def effective_provider_order(provider_order: list[str], provider_options: dict[str, Any]) -> list[str]:
+    effective: list[str] = []
+    for provider_name in provider_order:
+        normalized = normalize_provider_name(provider_name)
+        if normalized in effective:
+            continue
+        if not provider_is_enabled(normalized, provider_options_for(provider_options, normalized)):
+            continue
+        effective.append(normalized)
+
+    if "cache" not in effective:
+        effective.append("cache")
+    return effective
+
+
 def load_config(config_path: str | Path) -> dict[str, Any]:
     load_dotenv()
     path = Path(config_path)
@@ -99,12 +121,18 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         config["app"]["output_dir"] = os.getenv("OUTPUT_DIR")
 
     market = config.setdefault("market", {})
-    # Only the new env name may override provider order. Old MARKET_PROVIDER/MARKET_PROVIDER_CHAIN
-    # values are ignored so an existing server .env cannot accidentally disable Stooq fallback.
-    if os.getenv("MARKET_DATA_PROVIDER_ORDER"):
-        market["market_data_provider_order"] = parse_provider_order(os.getenv("MARKET_DATA_PROVIDER_ORDER"))
+    config_provider_order = configured_provider_order(market)
+    env_provider_order = os.getenv("MARKET_DATA_PROVIDER_ORDER")
+    # Only the new env name may override provider order. A legacy server .env that still says
+    # stooq,yfinance,cache should not silently block the new FMP-first config.yaml default.
+    if env_provider_order:
+        env_order = parse_provider_order(env_provider_order)
+        if "fmp" in config_provider_order and "fmp" not in env_order:
+            market["market_data_provider_order"] = config_provider_order
+        else:
+            market["market_data_provider_order"] = env_order
     else:
-        market["market_data_provider_order"] = configured_provider_order(market)
+        market["market_data_provider_order"] = config_provider_order
     market["provider_chain"] = market["market_data_provider_order"]
 
     if os.getenv("MARKET_REQUEST_DELAY_SEC"):
@@ -214,11 +242,6 @@ def load_cache(path: Path, max_age_hours: int, max_trading_days: int) -> tuple[p
     return frame, None
 
 
-def provider_options_for(provider_options: dict[str, Any], provider_name: str) -> dict[str, Any]:
-    value = provider_options.get(provider_name) or provider_options.get(provider_name.lower()) or {}
-    return value if isinstance(value, dict) else {}
-
-
 def fetch_history_with_provider_order(
     ticker: str,
     period: str,
@@ -230,9 +253,11 @@ def fetch_history_with_provider_order(
     retry_backoff_sec: float,
     cache_max_age_hours: int,
     cache_max_trading_days: int,
+    provider_instances: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, str | None, bool, str | None, str]:
     errors: list[str] = []
     ticker_cache_path = cache_path(cache_dir, ticker, period, interval)
+    provider_instances = provider_instances or {}
 
     for provider_name in provider_order:
         normalized = normalize_provider_name(provider_name)
@@ -246,8 +271,13 @@ def fetch_history_with_provider_order(
                 errors.append("cache: no cache fallback available")
             continue
 
+        if not provider_is_enabled(normalized, provider_options_for(provider_options, normalized)):
+            continue
+
         try:
-            provider = make_provider(normalized, provider_options_for(provider_options, normalized))
+            provider = provider_instances.get(normalized)
+            if provider is None:
+                provider = make_provider(normalized, provider_options_for(provider_options, normalized))
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{normalized}: {exc}")
             continue
@@ -359,13 +389,39 @@ def save_market_cache_snapshot(market_data: dict[str, Any], snapshot_path: str |
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
+def build_provider_instances(
+    provider_order: list[str],
+    provider_options: dict[str, Any],
+    universe: list[dict[str, str]],
+) -> dict[str, Any]:
+    instances: dict[str, Any] = {}
+    if "fmp" not in provider_order:
+        return instances
+
+    try:
+        provider = make_provider("fmp", provider_options_for(provider_options, "fmp"))
+    except Exception:
+        return instances
+
+    instances["fmp"] = provider
+    prefetch_quotes = getattr(provider, "prefetch_quotes", None)
+    if callable(prefetch_quotes):
+        try:
+            prefetch_quotes([item["ticker"] for item in universe])
+        except Exception:
+            # Historical requests will still run per ticker and can fall back to Stooq/yfinance/cache.
+            pass
+    return instances
+
+
 def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
     timezone_name = config.get("app", {}).get("timezone", "Asia/Shanghai")
     market = config.get("market", {})
     period = market.get("period", "90d")
     interval = market.get("interval", "1d")
-    provider_order = configured_provider_order(market)
+    configured_order = configured_provider_order(market)
     provider_options = market.get("provider_options", {}) if isinstance(market.get("provider_options", {}), dict) else {}
+    provider_order = effective_provider_order(configured_order, provider_options)
     source = provider_chain_source(provider_order)
     request_delay_sec = float(market.get("request_delay_sec", 1.0))
     retry_count = max(1, int(market.get("retry_count", 1)))
@@ -379,6 +435,7 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
 
     assets: list[dict[str, Any]] = []
     universe = universe_from_config(config)
+    provider_instances = build_provider_instances(provider_order, provider_options, universe)
     for index, asset in enumerate(universe):
         if index > 0 and request_delay_sec > 0:
             time.sleep(request_delay_sec)
@@ -394,6 +451,7 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
             retry_backoff_sec,
             cache_max_age_hours,
             cache_max_trading_days,
+            provider_instances,
         )
         summary = summarize_price_frame(frame)
         source_info = {
@@ -422,6 +480,7 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
     market_data = {
         "metadata": {
             "source": source,
+            "configured_market_data_provider_order": configured_order,
             "provider_chain": provider_order,
             "market_data_provider_order": provider_order,
             "period": period,
