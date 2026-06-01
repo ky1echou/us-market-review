@@ -25,6 +25,7 @@ market:
     fmp:
       # 这里只写环境变量名，不写真实 API key。
       api_key_env: FMP_API_KEY
+      base_url: https://financialmodelingprep.com/stable
       quote_batch_size: 80
       timeout: 20
       symbol_map:
