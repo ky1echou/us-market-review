@@ -98,7 +98,7 @@ jobs:
           REMOTE
 
       - name: Run report manually over SSH
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_report == true }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_report == 'true' }}
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
