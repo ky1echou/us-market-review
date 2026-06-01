@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -17,7 +17,7 @@ from .indicators import summarize_price_frame
 from .market_data_provider import make_provider, provider_display_name
 
 
-DEFAULT_PROVIDER_CHAIN = ["yfinance", "stooq"]
+DEFAULT_PROVIDER_ORDER = ["stooq", "yfinance", "cache"]
 MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。"
 
 
@@ -41,17 +41,43 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-def parse_provider_chain(value: Any) -> list[str]:
+def normalize_provider_name(name: str) -> str:
+    normalized = str(name).strip().lower()
+    aliases = {
+        "local_cache": "cache",
+        "local market cache": "cache",
+        "twelvedata": "twelve_data",
+        "alphavantage": "alpha_vantage",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def parse_provider_order(value: Any) -> list[str]:
     if value is None or value == "":
-        return DEFAULT_PROVIDER_CHAIN.copy()
-    if isinstance(value, list):
-        providers = [str(item).strip() for item in value if str(item).strip()]
+        providers = DEFAULT_PROVIDER_ORDER.copy()
+    elif isinstance(value, list):
+        providers = [normalize_provider_name(str(item)) for item in value if str(item).strip()]
     else:
-        providers = [item.strip() for item in str(value).split(",") if item.strip()]
-    providers = providers or DEFAULT_PROVIDER_CHAIN.copy()
-    if [provider.lower() for provider in providers] == ["yfinance"]:
-        return DEFAULT_PROVIDER_CHAIN.copy()
+        providers = [normalize_provider_name(item) for item in str(value).split(",") if item.strip()]
+
+    providers = providers or DEFAULT_PROVIDER_ORDER.copy()
+    if "cache" not in providers:
+        providers.append("cache")
     return providers
+
+
+# Backward-compatible name used by health_check and older callers.
+def parse_provider_chain(value: Any) -> list[str]:
+    return parse_provider_order(value)
+
+
+def configured_provider_order(market: dict[str, Any]) -> list[str]:
+    return parse_provider_order(
+        market.get(
+            "market_data_provider_order",
+            market.get("provider_order", market.get("provider_chain", DEFAULT_PROVIDER_ORDER)),
+        )
+    )
 
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
@@ -73,10 +99,14 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         config["app"]["output_dir"] = os.getenv("OUTPUT_DIR")
 
     market = config.setdefault("market", {})
-    if os.getenv("MARKET_PROVIDER_CHAIN"):
-        market["provider_chain"] = parse_provider_chain(os.getenv("MARKET_PROVIDER_CHAIN"))
-    elif os.getenv("MARKET_PROVIDER"):
-        market["provider_chain"] = parse_provider_chain(os.getenv("MARKET_PROVIDER", "yfinance"))
+    # Only the new env name may override provider order. Old MARKET_PROVIDER/MARKET_PROVIDER_CHAIN
+    # values are ignored so an existing server .env cannot accidentally disable Stooq fallback.
+    if os.getenv("MARKET_DATA_PROVIDER_ORDER"):
+        market["market_data_provider_order"] = parse_provider_order(os.getenv("MARKET_DATA_PROVIDER_ORDER"))
+    else:
+        market["market_data_provider_order"] = configured_provider_order(market)
+    market["provider_chain"] = market["market_data_provider_order"]
+
     if os.getenv("MARKET_REQUEST_DELAY_SEC"):
         market["request_delay_sec"] = env_float("MARKET_REQUEST_DELAY_SEC", float(market.get("request_delay_sec", 1.0)))
     if os.getenv("MARKET_RETRY_COUNT"):
@@ -85,8 +115,12 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         market["retry_backoff_sec"] = env_float("MARKET_RETRY_BACKOFF_SEC", float(market.get("retry_backoff_sec", 4.0)))
     if os.getenv("MARKET_CACHE_DIR"):
         market["cache_dir"] = os.getenv("MARKET_CACHE_DIR")
+    if os.getenv("MARKET_CACHE_SNAPSHOT_PATH"):
+        market["cache_snapshot_path"] = os.getenv("MARKET_CACHE_SNAPSHOT_PATH")
     if os.getenv("MARKET_CACHE_MAX_AGE_HOURS"):
         market["cache_max_age_hours"] = env_int("MARKET_CACHE_MAX_AGE_HOURS", int(market.get("cache_max_age_hours", 168)))
+    if os.getenv("MARKET_CACHE_MAX_TRADING_DAYS"):
+        market["cache_max_trading_days"] = env_int("MARKET_CACHE_MAX_TRADING_DAYS", int(market.get("cache_max_trading_days", 3)))
     if os.getenv("MARKET_MIN_SUCCESS_RATIO"):
         market["min_success_ratio"] = env_float("MARKET_MIN_SUCCESS_RATIO", float(market.get("min_success_ratio", 0.7)))
 
@@ -142,7 +176,20 @@ def save_cache(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index_label="Date")
 
 
-def load_cache(path: Path, max_age_hours: int) -> tuple[pd.DataFrame, str | None]:
+def trading_days_since(latest: date, today: date | None = None) -> int:
+    today = today or datetime.now().date()
+    if latest >= today:
+        return 0
+    days = 0
+    cursor = latest + timedelta(days=1)
+    while cursor <= today:
+        if cursor.weekday() < 5:
+            days += 1
+        cursor += timedelta(days=1)
+    return days
+
+
+def load_cache(path: Path, max_age_hours: int, max_trading_days: int) -> tuple[pd.DataFrame, str | None]:
     if not path.exists():
         return pd.DataFrame(), None
 
@@ -157,6 +204,13 @@ def load_cache(path: Path, max_age_hours: int) -> tuple[pd.DataFrame, str | None
 
     if frame.empty:
         return pd.DataFrame(), "cache is empty"
+
+    latest_index = pd.Timestamp(frame.index.max())
+    latest_date = latest_index.date()
+    days_since = trading_days_since(latest_date)
+    if days_since > max_trading_days:
+        return pd.DataFrame(), f"cache latest date {latest_date} is older than {max_trading_days} trading days"
+
     return frame, None
 
 
@@ -165,6 +219,55 @@ def provider_options_for(provider_options: dict[str, Any], provider_name: str) -
     return value if isinstance(value, dict) else {}
 
 
+def fetch_history_with_provider_order(
+    ticker: str,
+    period: str,
+    interval: str,
+    provider_order: list[str],
+    provider_options: dict[str, Any],
+    cache_dir: str | Path,
+    retry_count: int,
+    retry_backoff_sec: float,
+    cache_max_age_hours: int,
+    cache_max_trading_days: int,
+) -> tuple[pd.DataFrame, str | None, bool, str | None, str]:
+    errors: list[str] = []
+    ticker_cache_path = cache_path(cache_dir, ticker, period, interval)
+
+    for provider_name in provider_order:
+        normalized = normalize_provider_name(provider_name)
+        if normalized == "cache":
+            cached_frame, cache_error = load_cache(ticker_cache_path, cache_max_age_hours, cache_max_trading_days)
+            if not cached_frame.empty:
+                return cached_frame, "; ".join(errors) if errors else None, True, None, "Local market cache"
+            if cache_error:
+                errors.append(f"cache: {cache_error}")
+            else:
+                errors.append("cache: no cache fallback available")
+            continue
+
+        try:
+            provider = make_provider(normalized, provider_options_for(provider_options, normalized))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{normalized}: {exc}")
+            continue
+
+        for attempt in range(1, retry_count + 1):
+            try:
+                frame = provider.fetch_history(ticker, period, interval)
+                if frame is None or frame.empty:
+                    raise ValueError("empty price history")
+                save_cache(frame, ticker_cache_path)
+                return frame, None, False, None, provider.name
+            except Exception as exc:  # noqa: BLE001 - try next provider, then cache.
+                errors.append(f"{provider.name} attempt {attempt}/{retry_count}: {exc}")
+                if attempt < retry_count:
+                    time.sleep(retry_backoff_sec * attempt)
+
+    return pd.DataFrame(), "; ".join(errors), False, None, ""
+
+
+# Backward-compatible wrapper used by older imports.
 def fetch_history_with_provider_chain(
     ticker: str,
     period: str,
@@ -176,36 +279,18 @@ def fetch_history_with_provider_chain(
     retry_backoff_sec: float,
     cache_max_age_hours: int,
 ) -> tuple[pd.DataFrame, str | None, bool, str | None, str]:
-    errors: list[str] = []
-    for provider_name in provider_chain:
-        try:
-            provider = make_provider(provider_name, provider_options_for(provider_options, provider_name))
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{provider_name}: {exc}")
-            continue
-
-        for attempt in range(1, retry_count + 1):
-            try:
-                frame = provider.fetch_history(ticker, period, interval)
-                if frame is None or frame.empty:
-                    raise ValueError("empty price history")
-                save_cache(frame, cache_path(cache_dir, ticker, period, interval))
-                return frame, None, False, None, provider.name
-            except Exception as exc:  # noqa: BLE001 - try next provider, then cache.
-                errors.append(f"{provider.name} attempt {attempt}/{retry_count}: {exc}")
-                if attempt < retry_count:
-                    time.sleep(retry_backoff_sec * attempt)
-
-    cached_frame, cache_error = load_cache(cache_path(cache_dir, ticker, period, interval), cache_max_age_hours)
-    if not cached_frame.empty:
-        return cached_frame, "; ".join(errors), True, None, "Local market cache"
-
-    error_text = "; ".join(errors)
-    if cache_error:
-        error_text = f"{error_text}; cache fallback failed: {cache_error}"
-    else:
-        error_text = f"{error_text}; no cache fallback available"
-    return pd.DataFrame(), error_text, False, cache_error, ""
+    return fetch_history_with_provider_order(
+        ticker,
+        period,
+        interval,
+        parse_provider_order(provider_chain),
+        provider_options,
+        cache_dir,
+        retry_count,
+        retry_backoff_sec,
+        cache_max_age_hours,
+        3,
+    )
 
 
 def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: str, min_success_ratio: float) -> dict[str, Any]:
@@ -261,19 +346,34 @@ def provider_chain_source(provider_chain: list[str]) -> str:
     return " -> ".join(names)
 
 
+def save_market_cache_snapshot(market_data: dict[str, Any], snapshot_path: str | Path) -> None:
+    metadata = market_data.get("metadata", {})
+    if int(metadata.get("success_count") or 0) <= 0:
+        return
+    path = Path(snapshot_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "metadata": metadata,
+        "assets": [asset for asset in market_data.get("assets", []) if asset.get("last_close") is not None],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
 def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
     timezone_name = config.get("app", {}).get("timezone", "Asia/Shanghai")
     market = config.get("market", {})
     period = market.get("period", "90d")
     interval = market.get("interval", "1d")
-    provider_chain = parse_provider_chain(market.get("provider_chain", market.get("provider", DEFAULT_PROVIDER_CHAIN)))
+    provider_order = configured_provider_order(market)
     provider_options = market.get("provider_options", {}) if isinstance(market.get("provider_options", {}), dict) else {}
-    source = provider_chain_source(provider_chain)
+    source = provider_chain_source(provider_order)
     request_delay_sec = float(market.get("request_delay_sec", 1.0))
     retry_count = max(1, int(market.get("retry_count", 1)))
     retry_backoff_sec = float(market.get("retry_backoff_sec", 4.0))
     cache_dir = market.get("cache_dir", "data/processed/market_cache")
+    cache_snapshot_path = market.get("cache_snapshot_path", "data/processed/market_cache.json")
     cache_max_age_hours = int(market.get("cache_max_age_hours", 168))
+    cache_max_trading_days = int(market.get("cache_max_trading_days", 3))
     min_success_ratio = float(market.get("min_success_ratio", 0.7))
     fetched_at = now_iso(timezone_name)
 
@@ -283,16 +383,17 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
         if index > 0 and request_delay_sec > 0:
             time.sleep(request_delay_sec)
 
-        frame, error, from_cache, cache_error, actual_provider = fetch_history_with_provider_chain(
+        frame, error, from_cache, cache_error, actual_provider = fetch_history_with_provider_order(
             asset["ticker"],
             period,
             interval,
-            provider_chain,
+            provider_order,
             provider_options,
             cache_dir,
             retry_count,
             retry_backoff_sec,
             cache_max_age_hours,
+            cache_max_trading_days,
         )
         summary = summarize_price_frame(frame)
         source_info = {
@@ -318,10 +419,11 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
         )
 
     quality = build_market_quality(assets, source, fetched_at, min_success_ratio)
-    return {
+    market_data = {
         "metadata": {
             "source": source,
-            "provider_chain": provider_chain,
+            "provider_chain": provider_order,
+            "market_data_provider_order": provider_order,
             "period": period,
             "interval": interval,
             "fetched_at": fetched_at,
@@ -330,11 +432,15 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
             "retry_count": retry_count,
             "retry_backoff_sec": retry_backoff_sec,
             "cache_dir": str(cache_dir),
+            "cache_snapshot_path": str(cache_snapshot_path),
             "cache_max_age_hours": cache_max_age_hours,
+            "cache_max_trading_days": cache_max_trading_days,
             **quality,
         },
         "assets": assets,
     }
+    save_market_cache_snapshot(market_data, cache_snapshot_path)
+    return market_data
 
 
 def assets_by_category(market_data: dict[str, Any], category: str) -> list[dict[str, Any]]:
