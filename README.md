@@ -4,10 +4,10 @@
 
 当前 MVP 数据来源：
 
-- 行情：优先 Yahoo Finance via `yfinance`，失败后自动切换 Stooq daily CSV，再失败才使用本地缓存
+- 行情：默认 Stooq daily CSV，失败后切换 Yahoo Finance via `yfinance`，再失败才使用本地缓存
 - 新闻：`config.yaml` 中配置的公开 RSS 源，并使用严格主题相关性评分筛选
 - 配置：`.env` 与 `config.yaml`
-- 日志：`logs/daily.log`
+- 日志：`logs/daily.log` 与 `logs/provider_check.log`
 
 项目不会编造关键数字。行情可用率低于 70% 时，系统会立刻停止正式报告生成：不生成 Markdown，不生成 PDF，也不发送任何报告文件，只向 Telegram 推送状态消息：
 
@@ -60,17 +60,21 @@ FEISHU_SECRET=
 默认配置：
 
 ```env
-MARKET_PROVIDER_CHAIN=yfinance,stooq
+MARKET_DATA_PROVIDER_ORDER=stooq,yfinance,cache
 MARKET_REQUEST_DELAY_SEC=1.0
 MARKET_RETRY_COUNT=1
 MARKET_RETRY_BACKOFF_SEC=4.0
 MARKET_CACHE_DIR=data/processed/market_cache
+MARKET_CACHE_SNAPSHOT_PATH=data/processed/market_cache.json
 MARKET_CACHE_MAX_AGE_HOURS=168
+MARKET_CACHE_MAX_TRADING_DAYS=3
 MARKET_MIN_SUCCESS_RATIO=0.7
 RUN_DAILY_TIMEOUT=20m
 ```
 
-含义：先尝试 yfinance；如果遇到 Yahoo 限流或空数据，自动尝试 Stooq；两者都失败时才读取本地缓存。Stooq 核心指数、ETF、科技股映射维护在 `config.yaml` 的 `market.provider_options.stooq.symbol_map` 中。
+含义：先尝试 Stooq；如果 Stooq 空数据或网络失败，再尝试 yfinance；两者都失败时才读取本地缓存。旧的 `MARKET_PROVIDER` / `MARKET_PROVIDER_CHAIN` 不会覆盖 `config.yaml` 中的 fallback chain，避免服务器旧 `.env` 把 Stooq fallback 关掉。
+
+当前正式报告只抓 MVP 核心池，约 27 个标的：SPY、QQQ、DIA、IWM、SMH、SOXX、XLK、XLF、XLE、XLV、TLT、GLD、USO，以及 NVDA、MSFT、AAPL、AMZN、GOOGL、META、TSLA、AMD、AVGO、MU、MRVL、ARM、SNOW、NOW。
 
 已预留后续正式行情源配置入口：
 
@@ -80,6 +84,19 @@ ALPHA_VANTAGE_API_KEY=
 POLYGON_API_KEY=
 ```
 
+## 行情源诊断
+
+只测试 10 个核心标的，不会请求完整日报股票池：
+
+```bash
+cd /opt/us-market-review
+source .venv/bin/activate
+python -m src.provider_check --provider all --config config.yaml
+cat logs/provider_check.log
+```
+
+默认测试：SPY、QQQ、DIA、IWM、NVDA、MSFT、AAPL、AMD、AVGO、TSLA。输出会显示每个 provider 的成功数量、失败数量、失败原因，以及每个 ticker 实际请求的 symbol，例如 `AAPL -> aapl.us`。
+
 ## 手动测试
 
 ```bash
@@ -87,6 +104,7 @@ cd /opt/us-market-review
 source .venv/bin/activate
 python test_send.py
 python -m src.health_check --config config.yaml
+python -m src.provider_check --provider stooq --config config.yaml
 bash run_daily.sh
 tail -n 120 logs/daily.log
 ```
@@ -116,8 +134,9 @@ us-market-review 正在运行，已跳过本次触发。
 - `git fetch` / `git reset --hard origin/main`
 - `bash scripts/install_ubuntu.sh`
 - `python -m src.health_check --config config.yaml`
+- `python -m src.provider_check --provider stooq --config config.yaml --tickers SPY,QQQ,DIA,IWM,NVDA`
 
-默认不会运行 `bash run_daily.sh`，避免每次 push 都抓行情、加重限流。
+默认不会运行 `bash run_daily.sh`，避免每次 push 都抓完整行情、加重限流。
 
 如需手动从 GitHub Actions 跑一次正式日报：
 
@@ -164,6 +183,7 @@ us-market-review/
   src/
     fetch_market.py
     market_data_provider.py
+    provider_check.py
     health_check.py
     indicators.py
     fetch_news.py
