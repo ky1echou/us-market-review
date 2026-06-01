@@ -7,19 +7,54 @@ app:
   report_language: zh-CN
 
 market:
-  # 第一阶段先保证 MVP 稳定：默认 Stooq -> yfinance -> cache。
-  # Yahoo/yfinance 在云服务器上容易 429，因此先用 Stooq daily CSV。
+  # 默认先用 FMP；如果 .env 里没有 FMP_API_KEY，程序会自动跳过 FMP。
+  # 后续依次 fallback 到 Stooq、yfinance、本地缓存。
   market_data_provider_order:
+    - fmp
     - stooq
     - yfinance
     - cache
   # Backward-compatible alias for older code paths.
   provider_chain:
+    - fmp
     - stooq
     - yfinance
     - cache
 
   provider_options:
+    fmp:
+      # 这里只写环境变量名，不写真实 API key。
+      api_key_env: FMP_API_KEY
+      quote_batch_size: 80
+      timeout: 20
+      symbol_map:
+        SPY: SPY
+        QQQ: QQQ
+        DIA: DIA
+        IWM: IWM
+        SMH: SMH
+        SOXX: SOXX
+        XLK: XLK
+        XLF: XLF
+        XLE: XLE
+        XLV: XLV
+        TLT: TLT
+        GLD: GLD
+        USO: USO
+        NVDA: NVDA
+        MSFT: MSFT
+        AAPL: AAPL
+        AMZN: AMZN
+        GOOGL: GOOGL
+        META: META
+        TSLA: TSLA
+        AMD: AMD
+        AVGO: AVGO
+        MU: MU
+        MRVL: MRVL
+        ARM: ARM
+        SNOW: SNOW
+        NOW: NOW
     stooq:
       # Stooq 备用源代码映射。指数优先用 ETF 替代，降低指数代码不稳定对成功率的影响。
       symbol_map:
@@ -80,7 +115,7 @@ market:
   # 行情可用率低于该阈值时，不生成正式 Markdown/PDF，只推送失败提示。
   min_success_ratio: 0.7
 
-  # 指数层先用可稳定获取的 ETF 代理，避免指数代码失败拖垮日报。
+  # 第一阶段正式报告只抓 MVP 核心池，避免覆盖过宽拖垮成功率。
   benchmarks:
     - ticker: SPY
       name: 标普500ETF
