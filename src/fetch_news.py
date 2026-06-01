@@ -19,8 +19,11 @@ AI_COMPANIES = {
     "anthropic",
     "google",
     "alphabet",
+    "gemini",
+    "deepmind",
     "meta",
     "microsoft",
+    "azure",
     "nvidia",
     "nvda",
     "amd",
@@ -34,25 +37,53 @@ AI_COMPANIES = {
     "marvell",
     "mrvl",
 }
-AI_TOPICS = {
+AI_EXPLICIT_TERMS = {
+    "ai",
     "artificial intelligence",
     "generative ai",
+    "genai",
     "large language model",
     "llm",
+    "foundation model",
+}
+AI_MODEL_TERMS = {
+    "chatbot",
+    "copilot",
+    "agent",
+    "agents",
+    "model training",
+    "inference",
+    "open-weight",
+    "multimodal",
+}
+AI_CHIP_TERMS = {
     "ai chip",
     "gpu",
     "accelerator",
+    "hbm",
+    "asic",
     "semiconductor",
+    "chip demand",
+    "advanced packaging",
+}
+AI_INFRA_TERMS = {
     "data center",
     "datacenter",
     "cloud capex",
-    "capex",
-    "inference",
+    "capital expenditure",
+    "server rack",
     "training cluster",
+    "power demand",
+    "liquid cooling",
+}
+AI_APP_TERMS = {
+    "ai application",
+    "enterprise ai",
+    "saas",
+    "automation",
     "robotics",
     "autonomous driving",
     "self-driving",
-    "saas",
 }
 MACRO_TERMS = {
     "fed",
@@ -103,6 +134,22 @@ GEOPOLITICS_TERMS = {
     "war",
     "ceasefire",
 }
+TICKER_ALIASES = {
+    "NVDA": {"nvidia", "nvda"},
+    "AMD": {"amd", "advanced micro devices"},
+    "AVGO": {"broadcom", "avgo"},
+    "MSFT": {"microsoft", "msft", "azure"},
+    "GOOGL": {"google", "alphabet", "googl", "gemini", "deepmind"},
+    "META": {"meta", "facebook"},
+    "AMZN": {"amazon", "amzn", "aws"},
+    "AAPL": {"apple", "aapl"},
+    "TSLA": {"tesla", "tsla"},
+    "MU": {"micron", "mu"},
+    "MRVL": {"marvell", "mrvl"},
+    "ARM": {"arm"},
+    "SNOW": {"snowflake", "snow"},
+    "NOW": {"servicenow", "now"},
+}
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -136,18 +183,46 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
+def phrase_present(normalized_text: str, term: str) -> bool:
+    normalized_term = term.lower().strip()
+    if not normalized_term:
+        return False
+    if re.fullmatch(r"[a-z0-9.+-]+", normalized_term):
+        pattern = rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])"
+        return bool(re.search(pattern, normalized_text))
+    return normalized_term in normalized_text
+
+
 def term_hits(text: str, terms: set[str] | list[str]) -> list[str]:
     normalized = normalize_text(text)
-    return [term for term in terms if term.lower() in normalized]
+    return [term for term in terms if phrase_present(normalized, term)]
 
 
 def ai_relevance(text: str) -> tuple[int, list[str]]:
     company_hits = term_hits(text, AI_COMPANIES)
-    topic_hits = term_hits(text, AI_TOPICS)
-    explicit_ai = bool(re.search(r"\bai\b|artificial intelligence|generative ai|large language model|\bllm\b", normalize_text(text)))
-    score = len(set(company_hits)) + len(set(topic_hits))
-    if explicit_ai:
-        score += 2
+    explicit_hits = term_hits(text, AI_EXPLICIT_TERMS)
+    model_hits = term_hits(text, AI_MODEL_TERMS)
+    chip_hits = term_hits(text, AI_CHIP_TERMS)
+    infra_hits = term_hits(text, AI_INFRA_TERMS)
+    app_hits = term_hits(text, AI_APP_TERMS)
+    topic_hits = sorted(set(explicit_hits + model_hits + chip_hits + infra_hits + app_hits))
+
+    model_company_hits = {"openai", "anthropic", "gemini", "deepmind"}.intersection(set(company_hits))
+    qualified = bool(model_company_hits)
+    qualified = qualified or bool(explicit_hits and (company_hits or model_hits or chip_hits or infra_hits or app_hits))
+    qualified = qualified or bool(company_hits and (model_hits or chip_hits or infra_hits or app_hits))
+    if not qualified:
+        return 0, []
+
+    score = 0
+    score += len(set(company_hits)) * 2
+    score += len(set(explicit_hits)) * 3
+    score += len(set(model_hits)) * 2
+    score += len(set(chip_hits)) * 2
+    score += len(set(infra_hits)) * 2
+    score += len(set(app_hits))
+    if model_company_hits:
+        score += 3
     if company_hits and topic_hits:
         score += 2
     reasons = sorted(set(company_hits + topic_hits))
@@ -161,7 +236,7 @@ def infer_tags(title: str, summary: str, config: dict[str, Any]) -> tuple[list[s
     reasons: dict[str, list[str]] = {}
 
     ai_score, ai_reasons = ai_relevance(text)
-    if ai_score >= 4:
+    if ai_score >= 5:
         tags.append("AI")
         scores["AI"] = ai_score
         reasons["AI"] = ai_reasons
@@ -184,11 +259,15 @@ def infer_tags(title: str, summary: str, config: dict[str, Any]) -> tuple[list[s
         scores["地缘"] = len(set(geopolitics_hits))
         reasons["地缘"] = sorted(set(geopolitics_hits))
 
+    normalized = normalize_text(text)
     for stock in config.get("market", {}).get("key_stocks", []):
-        ticker = str(stock.get("ticker", ""))
-        name = str(stock.get("name", ""))
-        company_terms = {ticker.lower(), name.lower()} - {""}
-        if term_hits(text, company_terms):
+        ticker = str(stock.get("ticker", "")).strip().upper()
+        aliases = set(TICKER_ALIASES.get(ticker, set()))
+        aliases.add(ticker.lower())
+        name = str(stock.get("name", "")).strip().lower()
+        if name:
+            aliases.add(name)
+        if any(phrase_present(normalized, alias) for alias in aliases):
             tags.append(ticker)
 
     return sorted(set(tags)), scores, reasons
@@ -267,7 +346,7 @@ def fetch_news(config: dict[str, Any]) -> dict[str, Any]:
             "lookback_hours": lookback_hours,
             "fetched_at": fetched_at,
             "timezone": timezone_name,
-            "tagging": "score-based topical relevance",
+            "tagging": "strict topical relevance scoring",
         },
         "items": all_items,
         "errors": errors,
