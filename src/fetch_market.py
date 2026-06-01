@@ -18,6 +18,7 @@ from .market_data_provider import make_provider, provider_display_name
 
 
 DEFAULT_PROVIDER_CHAIN = ["yfinance", "stooq"]
+MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。"
 
 
 def env_float(name: str, default: float) -> float:
@@ -209,23 +210,26 @@ def fetch_history_with_provider_chain(
 
 def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: str, min_success_ratio: float) -> dict[str, Any]:
     total = len(assets)
-    usable = [asset for asset in assets if asset.get("last_close") is not None]
+    usable = [asset for asset in assets if asset.get("last_close") is not None and asset.get("daily_change") is not None]
     live_success = [asset for asset in usable if not asset.get("from_cache")]
     cache_success = [asset for asset in usable if asset.get("from_cache")]
     failed = total - len(usable)
     success_ratio = len(usable) / total if total else 0.0
     live_success_ratio = len(live_success) / total if total else 0.0
+    cache_success_ratio = len(cache_success) / total if total else 0.0
     provider_counts: dict[str, int] = {}
     for asset in usable:
         provider = str(asset.get("source", {}).get("provider") or "unknown")
         provider_counts[provider] = provider_counts.get(provider, 0) + 1
 
     warnings: list[str] = []
-    formal_report_allowed = live_success_ratio >= min_success_ratio
+    formal_report_allowed = total > 0 and success_ratio >= min_success_ratio
     if not formal_report_allowed:
-        warnings.append("今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。")
-    elif success_ratio < min_success_ratio:
-        warnings.append("行情数据不完整，请谨慎使用")
+        warnings.append(MARKET_FAILURE_MESSAGE)
+    elif cache_success:
+        warnings.append(f"部分行情使用本地缓存降级: {len(cache_success)} 项，请结合获取时间判断时效性。")
+    elif failed:
+        warnings.append(f"行情数据存在缺口: 失败 {failed} 项，但可用率仍达到正式报告阈值。")
 
     return {
         "source": source,
@@ -237,6 +241,7 @@ def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: 
         "failed_count": failed,
         "success_ratio": success_ratio,
         "live_success_ratio": live_success_ratio,
+        "cache_success_ratio": cache_success_ratio,
         "min_success_ratio": min_success_ratio,
         "data_complete": success_ratio >= min_success_ratio,
         "live_data_complete": live_success_ratio >= min_success_ratio,
