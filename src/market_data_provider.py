@@ -53,6 +53,13 @@ def period_to_days(period: str) -> int | None:
     return None
 
 
+def utc_now_naive() -> pd.Timestamp:
+    now = pd.Timestamp.utcnow()
+    if now.tzinfo is not None:
+        return now.tz_convert(None)
+    return now
+
+
 class FMPProvider:
     name = "Financial Modeling Prep"
     base_url = "https://financialmodelingprep.com/api/v3"
@@ -214,7 +221,7 @@ class FMPProvider:
         frame = normalize_history_frame(frame)
         days = period_to_days(period)
         if days:
-            cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days + 5)
+            cutoff = utc_now_naive() - pd.Timedelta(days=days + 5)
             frame = frame[frame.index >= cutoff]
         return frame
 
@@ -304,7 +311,7 @@ class StooqProvider:
         frame = normalize_history_frame(frame)
         days = period_to_days(period)
         if days:
-            cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days + 5)
+            cutoff = utc_now_naive() - pd.Timedelta(days=days + 5)
             frame = frame[frame.index >= cutoff]
         return frame
 
