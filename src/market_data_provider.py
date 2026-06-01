@@ -333,7 +333,7 @@ class FMPProvider:
         if previous_close is None and quote.change_percent not in (None, -100):
             previous_close = quote.price / (1 + quote.change_percent / 100)
 
-        today = pd.Timestamp.utcnow().tz_convert(None).normalize()
+        today = utc_now_naive().normalize()
         rows: list[dict[str, Any]] = []
         if previous_close not in (None, 0):
             rows.append({"Date": today - pd.Timedelta(days=1), "Close": previous_close, "Volume": None})
