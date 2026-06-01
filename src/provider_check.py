@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,7 @@ def disabled_provider_result(provider_name: str, tickers: list[str], provider_op
                 "rows": 0,
                 "latest": "",
                 "reason": "FMP_API_KEY is not configured" if provider_name == "fmp" else "provider is disabled",
+                "failure_category": "missing_api_key" if provider_name == "fmp" else "provider_disabled",
             }
         )
     return {
@@ -83,6 +85,53 @@ def disabled_provider_result(provider_name: str, tickers: list[str], provider_op
     }
 
 
+def check_fmp_provider(
+    tickers: list[str],
+    provider_options: dict[str, Any],
+) -> dict[str, Any]:
+    options = provider_options_for(provider_options, "fmp")
+    provider = make_provider("fmp", options)
+    rows: list[dict[str, Any]] = []
+    success = 0
+    failed = 0
+
+    for ticker in tickers:
+        diagnostic = getattr(provider, "diagnose_symbol")(ticker)
+        if diagnostic.get("quote_parse_success"):
+            success += 1
+            status = "ok"
+            reason = ""
+        else:
+            failed += 1
+            status = "failed"
+            reason = diagnostic.get("failure_category") or "unknown_error"
+        rows.append(
+            {
+                "ticker": ticker,
+                "symbol": diagnostic.get("symbol", ticker),
+                "status": status,
+                "rows": 1 if status == "ok" else 0,
+                "latest": "",
+                "reason": reason,
+                "failure_category": diagnostic.get("failure_category", ""),
+                "quote_parse_success": bool(diagnostic.get("quote_parse_success")),
+                "historical_parse_success": bool(diagnostic.get("historical_parse_success")),
+                "endpoints": diagnostic.get("endpoints", []),
+            }
+        )
+
+    api_key_meta = getattr(provider, "api_key_metadata")()
+    return {
+        "provider": provider_display_name("fmp"),
+        "provider_key": "fmp",
+        "enabled": bool(api_key_meta.get("exists")),
+        "api_key": api_key_meta,
+        "success_count": success,
+        "failed_count": failed,
+        "items": rows,
+    }
+
+
 def check_live_provider(
     provider_name: str,
     tickers: list[str],
@@ -90,6 +139,9 @@ def check_live_provider(
     interval: str,
     provider_options: dict[str, Any],
 ) -> dict[str, Any]:
+    if provider_name == "fmp":
+        return check_fmp_provider(tickers, provider_options)
+
     options = provider_options_for(provider_options, provider_name)
     if not provider_is_enabled(provider_name, options):
         return disabled_provider_result(provider_name, tickers, provider_options)
@@ -116,6 +168,7 @@ def check_live_provider(
                     "rows": 0,
                     "latest": "",
                     "reason": reason,
+                    "failure_category": "provider_error",
                 }
                 for ticker in tickers
             ],
@@ -144,6 +197,7 @@ def check_live_provider(
                     "rows": int(len(frame)),
                     "latest": str(frame.index.max()),
                     "reason": "",
+                    "failure_category": "",
                 }
             )
         except Exception as exc:  # noqa: BLE001 - diagnostic should continue.
@@ -156,6 +210,7 @@ def check_live_provider(
                     "rows": 0,
                     "latest": "",
                     "reason": truncate_reason(str(exc)),
+                    "failure_category": "provider_error",
                 }
             )
     return {
@@ -193,6 +248,7 @@ def check_cache_provider(
                     "rows": int(len(frame)),
                     "latest": str(frame.index.max()),
                     "reason": "",
+                    "failure_category": "",
                 }
             )
         else:
@@ -205,6 +261,7 @@ def check_cache_provider(
                     "rows": 0,
                     "latest": "",
                     "reason": truncate_reason(error or "no cache fallback available"),
+                    "failure_category": "empty_response",
                 }
             )
     return {
@@ -220,15 +277,42 @@ def check_cache_provider(
 def render_text(results: list[dict[str, Any]], generated_at: str, period: str, interval: str) -> str:
     lines = [f"provider_check generated_at={generated_at} period={period} interval={interval}"]
     for result in results:
+        api_key = result.get("api_key") or {}
+        if result.get("provider_key") == "fmp":
+            lines.append(
+                "FMP_API_KEY "
+                f"exists={'yes' if api_key.get('exists') else 'no'} "
+                f"length={api_key.get('length', 0)} "
+                f"trimmed_length={api_key.get('trimmed_length', 0)} "
+                f"outer_whitespace={'yes' if api_key.get('has_outer_whitespace') else 'no'} "
+                f"loaded_from_dotenv={'yes' if api_key.get('loaded_from_dotenv') else 'no'}"
+            )
         lines.append(
             f"provider={result['provider']} enabled={str(result.get('enabled', True)).lower()} "
             f"success={result['success_count']} failed={result['failed_count']}"
         )
         for item in result["items"]:
             reason = f" reason={item['reason']}" if item.get("reason") else ""
+            category = f" failure_category={item['failure_category']}" if item.get("failure_category") else ""
             lines.append(
-                f"  ticker={item['ticker']} symbol={item['symbol']} status={item['status']} rows={item['rows']} latest={item['latest']}{reason}"
+                f"  ticker={item['ticker']} symbol={item['symbol']} status={item['status']} rows={item['rows']} latest={item['latest']}{category}{reason}"
             )
+            if result.get("provider_key") == "fmp":
+                lines.append(
+                    f"    quote_parse_success={'yes' if item.get('quote_parse_success') else 'no'} "
+                    f"historical_parse_success={'yes' if item.get('historical_parse_success') else 'no'}"
+                )
+                for endpoint in item.get("endpoints", []):
+                    lines.append(
+                        "    endpoint="
+                        f"{endpoint.get('endpoint_type')} "
+                        f"url={endpoint.get('url')} "
+                        f"http_status={endpoint.get('http_status')} "
+                        f"json_type={endpoint.get('json_type')} "
+                        f"parse_success={'yes' if endpoint.get('parse_success') else 'no'} "
+                        f"failure_category={endpoint.get('failure_category', '')} "
+                        f"preview={endpoint.get('preview', '')}"
+                    )
     return "\n".join(lines) + "\n"
 
 
@@ -242,18 +326,28 @@ def write_log(text: str) -> None:
         path.write_text(text, encoding="utf-8")
 
 
+def fmp_result_failed(results: list[dict[str, Any]], selected_providers: list[str]) -> bool:
+    if selected_providers != ["fmp"]:
+        return False
+    for result in results:
+        if result.get("provider_key") == "fmp":
+            return int(result.get("success_count") or 0) == 0
+    return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check FMP, Stooq, yfinance, and local cache with a small core ticker set.")
     parser.add_argument("--provider", default="all", help="all, fmp, stooq, yfinance, or cache")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--tickers", default="", help="Optional comma-separated ticker list. Defaults to 10 core tickers.")
+    parser.add_argument("--symbols", default="", help="Alias for --tickers, useful for FMP symbol diagnostics.")
     parser.add_argument("--json", action="store_true", help="Print JSON instead of text.")
     args = parser.parse_args()
 
     config = load_config(args.config)
     market = config.get("market", {})
     provider_options = market.get("provider_options", {}) if isinstance(market.get("provider_options", {}), dict) else {}
-    tickers = parse_tickers(args.tickers)
+    tickers = parse_tickers(args.symbols or args.tickers)
     selected_providers = providers_to_check(args.provider)
     period = str(market.get("provider_check_period", market.get("period", "90d")))
     interval = str(market.get("interval", "1d"))
@@ -281,6 +375,8 @@ def main() -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(results, generated_at, period, interval)
     write_log(text)
     print(text, end="")
+    if fmp_result_failed(results, selected_providers):
+        sys.exit(2)
 
 
 if __name__ == "__main__":
