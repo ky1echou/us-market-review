@@ -323,9 +323,17 @@ def fetch_history_with_provider_chain(
     )
 
 
+def asset_is_usable(asset: dict[str, Any]) -> bool:
+    if asset.get("last_close") is None:
+        return False
+    if asset.get("daily_change") is not None:
+        return True
+    return bool(asset.get("quote_success"))
+
+
 def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: str, min_success_ratio: float) -> dict[str, Any]:
     total = len(assets)
-    usable = [asset for asset in assets if asset.get("last_close") is not None and asset.get("daily_change") is not None]
+    usable = [asset for asset in assets if asset_is_usable(asset)]
     live_success = [asset for asset in usable if not asset.get("from_cache")]
     cache_success = [asset for asset in usable if asset.get("from_cache")]
     failed = total - len(usable)
@@ -409,7 +417,7 @@ def build_provider_instances(
         try:
             prefetch_quotes([item["ticker"] for item in universe])
         except Exception:
-            # Historical requests will still run per ticker and can fall back to Stooq/yfinance/cache.
+            # Single-symbol quote requests will still run per ticker and can fall back when needed.
             pass
     return instances
 
@@ -454,6 +462,8 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
             provider_instances,
         )
         summary = summarize_price_frame(frame)
+        frame_attrs = getattr(frame, "attrs", {}) if frame is not None else {}
+        quote_success = bool(frame_attrs.get("quote_success"))
         source_info = {
             "provider": actual_provider or source,
             "provider_chain": source,
@@ -463,6 +473,9 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
             "as_of": summary.get("as_of"),
             "fetched_at": fetched_at,
             "from_cache": from_cache,
+            "quote_success": quote_success,
+            "quote_only": bool(frame_attrs.get("fmp_quote_only")),
+            "historical_error_category": frame_attrs.get("historical_error_category", ""),
             "cache_path": str(cache_path(cache_dir, asset["ticker"], period, interval)) if from_cache else "",
         }
         assets.append(
@@ -473,6 +486,8 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
                 "error": error,
                 "from_cache": from_cache,
                 "cache_error": cache_error,
+                "quote_success": quote_success,
+                "quote_only": bool(frame_attrs.get("fmp_quote_only")),
             }
         )
 
