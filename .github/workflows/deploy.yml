@@ -49,6 +49,9 @@ jobs:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "${FMP_API_KEY:-}" ]; then
+            echo "::warning::FMP_API_KEY secret is empty or not configured; deployment will keep the existing server .env value if present."
+          fi
           FMP_API_KEY_B64="$(printf '%s' "${FMP_API_KEY:-}" | base64 -w 0)"
 
           ssh \
@@ -82,11 +85,22 @@ jobs:
             cat "${tmp_env}" > .env
             rm -f "${tmp_env}"
             unset FMP_API_KEY_VALUE
-            echo "FMP_API_KEY has been configured in server .env"
+            echo "FMP_API_KEY has been written to server .env"
           else
-            echo "FMP_API_KEY secret is not configured; existing server .env is left unchanged."
+            echo "FMP_API_KEY secret is empty; existing server .env is left unchanged."
           fi
           unset FMP_API_KEY_B64
+
+          if grep -q '^FMP_API_KEY=' .env; then
+            fmp_key_len="$(awk -F= '/^FMP_API_KEY=/{ print length(substr($0, index($0,"=")+1)); exit }' .env)"
+            if [ "${fmp_key_len:-0}" -gt 0 ]; then
+              echo "Confirmed FMP_API_KEY exists in server .env; length=${fmp_key_len}"
+            else
+              echo "::warning::FMP_API_KEY line exists in server .env but is empty."
+            fi
+          else
+            echo "::warning::FMP_API_KEY is not present in server .env."
+          fi
 
           bash scripts/install_ubuntu.sh
           REMOTE
@@ -114,9 +128,15 @@ jobs:
           fi
 
           "$PYTHON_BIN" -m src.health_check --config config.yaml
-          "$PYTHON_BIN" -m src.provider_check --provider fmp --config config.yaml --tickers SPY,QQQ,DIA,IWM,NVDA || true
+          set +e
+          "$PYTHON_BIN" -m src.provider_check --provider fmp --symbols AAPL,MSFT,NVDA --config config.yaml
+          provider_status=$?
+          set -e
+          if [ "${provider_status}" -ne 0 ]; then
+            echo "::warning::FMP provider_check failed. Review the diagnostic output above and logs/provider_check.log."
+          fi
           echo "Recent provider check log:"
-          tail -n 80 logs/provider_check.log || true
+          tail -n 120 logs/provider_check.log || true
           echo "Recent server log:"
           tail -n 80 logs/daily.log || true
           REMOTE
