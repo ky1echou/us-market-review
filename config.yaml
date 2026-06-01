@@ -7,42 +7,56 @@ app:
   report_language: zh-CN
 
 market:
-  # 行情源按顺序尝试：yfinance 失败后自动切到 Stooq，仍失败再使用本地缓存。
-  # 后续可继续扩展 Twelve Data / Alpha Vantage / Polygon。
-  provider_chain:
-    - yfinance
+  # 第一阶段先保证 MVP 稳定：默认 Stooq -> yfinance -> cache。
+  # Yahoo/yfinance 在云服务器上容易 429，因此先用 Stooq daily CSV。
+  market_data_provider_order:
     - stooq
+    - yfinance
+    - cache
+  # Backward-compatible alias for older code paths.
+  provider_chain:
+    - stooq
+    - yfinance
+    - cache
 
   provider_options:
     stooq:
-      # Stooq 备用源代码映射。ETF/股票通常是 xxx.us，这里显式列出核心标的，便于排查。
+      # Stooq 备用源代码映射。指数优先用 ETF 替代，降低指数代码不稳定对成功率的影响。
       symbol_map:
-        ^GSPC: ^spx
-        ^IXIC: ^ndq
-        ^DJI: ^dji
-        ^RUT: ^rut
-        ^SOX: ^sox
+        ^GSPC: spy.us
+        ^IXIC: qqq.us
+        ^DJI: dia.us
+        ^RUT: iwm.us
+        ^SOX: smh.us
         ^VIX: ^vix
         ^TNX: 10usy.b
         SPY: spy.us
         QQQ: qqq.us
+        DIA: dia.us
+        IWM: iwm.us
         SMH: smh.us
         SOXX: soxx.us
-        IWM: iwm.us
         XLK: xlk.us
-        XLE: xle.us
         XLF: xlf.us
+        XLE: xle.us
         XLV: xlv.us
+        TLT: tlt.us
+        GLD: gld.us
+        USO: uso.us
         NVDA: nvda.us
-        AMD: amd.us
-        AVGO: avgo.us
         MSFT: msft.us
+        AAPL: aapl.us
+        AMZN: amzn.us
         GOOGL: googl.us
         META: meta.us
-        AMZN: amzn.us
-        AAPL: aapl.us
         TSLA: tsla.us
-        BTC-USD: btcusd
+        AMD: amd.us
+        AVGO: avgo.us
+        MU: mu.us
+        MRVL: mrvl.us
+        ARM: arm.us
+        SNOW: snow.us
+        NOW: now.us
     twelve_data:
       api_key_env: TWELVE_DATA_API_KEY
     alpha_vantage:
@@ -51,99 +65,74 @@ market:
       api_key_env: POLYGON_API_KEY
 
   period: 90d
+  provider_check_period: 30d
   interval: 1d
 
-  # 减少限流：逐个 ticker 抓取，失败后切换备用源。
   request_delay_sec: 1.0
   retry_count: 1
   retry_backoff_sec: 4.0
 
   cache_dir: data/processed/market_cache
+  cache_snapshot_path: data/processed/market_cache.json
   cache_max_age_hours: 168
+  cache_max_trading_days: 3
 
   # 行情可用率低于该阈值时，不生成正式 Markdown/PDF，只推送失败提示。
   min_success_ratio: 0.7
 
+  # 指数层先用可稳定获取的 ETF 代理，避免指数代码失败拖垮日报。
   benchmarks:
-    - ticker: ^GSPC
-      name: 标普500
-    - ticker: ^IXIC
-      name: 纳斯达克综合
-    - ticker: ^DJI
-      name: 道琼斯工业
-    - ticker: ^RUT
-      name: 罗素2000
-    - ticker: ^SOX
-      name: 费城半导体
-    - ticker: ^VIX
-      name: VIX波动率
-
-  sector_etfs:
     - ticker: SPY
       name: 标普500ETF
     - ticker: QQQ
       name: 纳斯达克100ETF
+    - ticker: DIA
+      name: 道琼斯ETF
     - ticker: IWM
       name: 罗素2000ETF
-    - ticker: XLK
-      name: 科技
-    - ticker: XLC
-      name: 通信服务
-    - ticker: XLY
-      name: 可选消费
-    - ticker: XLF
-      name: 金融
-    - ticker: XLV
-      name: 医疗保健
-    - ticker: XLI
-      name: 工业
-    - ticker: XLE
-      name: 能源
-    - ticker: XLB
-      name: 材料
-    - ticker: XLP
-      name: 必需消费
-    - ticker: XLU
-      name: 公用事业
-    - ticker: XLRE
-      name: 房地产
+
+  sector_etfs:
     - ticker: SMH
       name: 半导体ETF
     - ticker: SOXX
       name: 半导体ETF
-    - ticker: ARKK
-      name: 创新成长
-    - ticker: KWEB
-      name: 中概互联网
+    - ticker: XLK
+      name: 科技
+    - ticker: XLF
+      name: 金融
+    - ticker: XLE
+      name: 能源
+    - ticker: XLV
+      name: 医疗保健
 
   key_stocks:
-    - ticker: AAPL
-      name: 苹果
-      theme: 科技龙头
-    - ticker: MSFT
-      name: 微软
-      theme: AI软件
     - ticker: NVDA
       name: 英伟达
       theme: AI算力
-    - ticker: GOOGL
-      name: Alphabet
-      theme: AI应用
+    - ticker: MSFT
+      name: 微软
+      theme: AI软件
+    - ticker: AAPL
+      name: 苹果
+      theme: 科技龙头
     - ticker: AMZN
       name: 亚马逊
       theme: 云计算/消费
+    - ticker: GOOGL
+      name: Alphabet
+      theme: AI应用
     - ticker: META
       name: Meta
       theme: AI广告
     - ticker: TSLA
       name: 特斯拉
       theme: 电动车/机器人
-    - ticker: AVGO
-      name: 博通
-      theme: AI网络/ASIC
     - ticker: AMD
       name: AMD
       theme: AI芯片
+    - ticker: AVGO
+      name: 博通
+      theme: AI网络/ASIC
     - ticker: MU
       name: 美光
       theme: AI存储/HBM
@@ -159,27 +148,14 @@ market:
     - ticker: NOW
       name: ServiceNow
       theme: AI软件/SaaS
-    - ticker: NFLX
-      name: 奈飞
-      theme: 流媒体
 
   macro_assets:
-    - ticker: ^TNX
-      name: 美国10年期国债收益率
     - ticker: TLT
       name: 20年期以上美债ETF
-    - ticker: IEF
-      name: 7-10年期美债ETF
-    - ticker: UUP
-      name: 美元指数ETF
     - ticker: GLD
       name: 黄金ETF
     - ticker: USO
       name: 原油ETF
-    - ticker: CPER
-      name: 铜ETF
-    - ticker: BTC-USD
-      name: 比特币
 
 news:
   lookback_hours: 36
@@ -247,12 +223,6 @@ ah_mapping:
     mapping_strength: 情绪映射
     a_h_mapping: 汽车零部件、机器人、智能驾驶、锂电
     watch_points: 关注交付、价格、FSD与机器人催化
-  - us_ticker: KWEB
-    us_name: 中概互联网ETF
-    theme: 中概/港股互联网
-    mapping_strength: 情绪映射
-    a_h_mapping: 港股互联网、平台经济、恒生科技
-    watch_points: 关注中概风险偏好对港股和A股互联网映射
 
 report:
   title: 中文美股复盘报告
