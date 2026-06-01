@@ -1,24 +1,28 @@
 # us-market-review
 
-`us-market-review` 是一个部署在 Ubuntu 24.04 云服务器上的中文美股复盘自动化项目。它会在美股收盘后抓取行情和公开 RSS 新闻，生成卖方投研日评风格的 Markdown 与 PDF 报告，并可通过 Telegram Bot 或飞书 Webhook 推送。
+`us-market-review` 是部署在 Ubuntu 24.04 云服务器上的中文美股复盘自动化项目。它会在美股收盘后抓取行情和公开 RSS 新闻，生成卖方投研日评风格的 Markdown 与 PDF 报告，并可通过 Telegram Bot 或飞书 Webhook 推送。
 
 当前 MVP 数据来源：
 
 - 行情：优先 Yahoo Finance via `yfinance`，失败后自动切换 Stooq daily CSV，再失败才使用本地缓存
-- 新闻：`config.yaml` 中配置的公开 RSS 源，并使用主题相关性评分筛选
+- 新闻：`config.yaml` 中配置的公开 RSS 源，并使用严格主题相关性评分筛选
 - 配置：`.env` 与 `config.yaml`
 - 日志：`logs/daily.log`
 
-项目不会编造关键数字。若实时行情成功率低于 70%，系统不会生成正式 Markdown/PDF，只会推送状态消息：
+项目不会编造关键数字。行情可用率低于 70% 时，系统会立刻停止正式报告生成：不生成 Markdown，不生成 PDF，也不发送任何报告文件，只向 Telegram 推送状态消息：
 
 ```text
 今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。
 行情成功数量: x/y
 行情失败数量: z
 行情成功率: xx.x%
+实时获取数量: a
+缓存降级数量: b
 数据源: ...
 获取时间: ...
 ```
+
+正式报告正文不会输出 `Too Many Requests`、`no cache fallback available`、抓取异常、技术报错或大面积缺失值表格；这些内容只会进入 `logs/daily.log`。
 
 ## 一键安装
 
@@ -66,7 +70,15 @@ MARKET_MIN_SUCCESS_RATIO=0.7
 RUN_DAILY_TIMEOUT=20m
 ```
 
-含义：先尝试 yfinance；如果遇到 Yahoo 限流或空数据，自动尝试 Stooq；两者都失败时才读取本地缓存。Stooq 指数代码可在 `config.yaml` 的 `market.provider_options.stooq.symbol_map` 中维护。
+含义：先尝试 yfinance；如果遇到 Yahoo 限流或空数据，自动尝试 Stooq；两者都失败时才读取本地缓存。Stooq 核心指数、ETF、科技股映射维护在 `config.yaml` 的 `market.provider_options.stooq.symbol_map` 中。
+
+已预留后续正式行情源配置入口：
+
+```env
+TWELVE_DATA_API_KEY=
+ALPHA_VANTAGE_API_KEY=
+POLYGON_API_KEY=
+```
 
 ## 手动测试
 
