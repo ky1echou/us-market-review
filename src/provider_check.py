@@ -148,8 +148,8 @@ def check_cache_provider(
     }
 
 
-def render_text(results: list[dict[str, Any]], generated_at: str) -> str:
-    lines = [f"provider_check generated_at={generated_at}"]
+def render_text(results: list[dict[str, Any]], generated_at: str, period: str, interval: str) -> str:
+    lines = [f"provider_check generated_at={generated_at} period={period} interval={interval}"]
     for result in results:
         lines.append(
             f"provider={result['provider']} success={result['success_count']} failed={result['failed_count']}"
@@ -160,6 +160,16 @@ def render_text(results: list[dict[str, Any]], generated_at: str) -> str:
                 f"  ticker={item['ticker']} symbol={item['symbol']} status={item['status']} rows={item['rows']} latest={item['latest']}{reason}"
             )
     return "\n".join(lines) + "\n"
+
+
+def write_log(text: str) -> None:
+    path = log_path()
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("a", encoding="utf-8") as file:
+            file.write("\n---\n")
+            file.write(text)
+    else:
+        path.write_text(text, encoding="utf-8")
 
 
 def main() -> None:
@@ -175,7 +185,7 @@ def main() -> None:
     provider_options = market.get("provider_options", {}) if isinstance(market.get("provider_options", {}), dict) else {}
     tickers = parse_tickers(args.tickers)
     selected_providers = providers_to_check(args.provider)
-    period = str(market.get("provider_check_period", "30d"))
+    period = str(market.get("period", "90d"))
     interval = str(market.get("interval", "1d"))
     cache_dir = str(market.get("cache_dir", "data/processed/market_cache"))
     cache_max_age_hours = int(market.get("cache_max_age_hours", 168))
@@ -194,10 +204,12 @@ def main() -> None:
         "config": args.config,
         "configured_provider_order": configured_provider_order(market),
         "tickers": tickers,
+        "period": period,
+        "interval": interval,
         "results": results,
     }
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(results, generated_at)
-    log_path().write_text(text, encoding="utf-8")
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(results, generated_at, period, interval)
+    write_log(text)
     print(text, end="")
 
 
