@@ -64,24 +64,28 @@ class StooqProvider:
     name = "Stooq daily CSV"
     base_url = "https://stooq.com/q/d/l/"
     default_symbol_map = {
-        "^GSPC": "^spx",
-        "^SPX": "^spx",
-        "^IXIC": "^ndq",
-        "^NDX": "^ndq",
-        "^DJI": "^dji",
-        "^RUT": "^rut",
-        "^SOX": "^sox",
+        "^GSPC": "spy.us",
+        "^SPX": "spy.us",
+        "^IXIC": "qqq.us",
+        "^NDX": "qqq.us",
+        "^DJI": "dia.us",
+        "^RUT": "iwm.us",
+        "^SOX": "smh.us",
         "^VIX": "^vix",
         "^TNX": "10usy.b",
         "SPY": "spy.us",
         "QQQ": "qqq.us",
+        "DIA": "dia.us",
+        "IWM": "iwm.us",
         "SMH": "smh.us",
         "SOXX": "soxx.us",
-        "IWM": "iwm.us",
         "XLK": "xlk.us",
         "XLE": "xle.us",
         "XLF": "xlf.us",
         "XLV": "xlv.us",
+        "TLT": "tlt.us",
+        "GLD": "gld.us",
+        "USO": "uso.us",
         "NVDA": "nvda.us",
         "AMD": "amd.us",
         "AVGO": "avgo.us",
@@ -91,6 +95,11 @@ class StooqProvider:
         "AMZN": "amzn.us",
         "AAPL": "aapl.us",
         "TSLA": "tsla.us",
+        "MU": "mu.us",
+        "MRVL": "mrvl.us",
+        "ARM": "arm.us",
+        "SNOW": "snow.us",
+        "NOW": "now.us",
         "BTC-USD": "btcusd",
     }
 
@@ -141,6 +150,8 @@ def make_provider(name: str, options: dict[str, Any] | None = None) -> MarketDat
     if normalized == "stooq":
         symbol_map = options.get("symbol_map") if isinstance(options, dict) else None
         return StooqProvider(symbol_map=symbol_map if isinstance(symbol_map, dict) else None)
+    if normalized in {"cache", "local_cache", "local market cache"}:
+        raise NotImplementedError("Cache is handled by fetch_market.py after live providers fail.")
     if normalized in {"twelve_data", "twelvedata", "alpha_vantage", "alphavantage", "polygon"}:
         raise NotImplementedError(
             f"Market provider '{name}' is configured but not implemented yet. "
@@ -150,4 +161,19 @@ def make_provider(name: str, options: dict[str, Any] | None = None) -> MarketDat
 
 
 def provider_display_name(name: str) -> str:
+    normalized = name.strip().lower()
+    if normalized in {"cache", "local_cache", "local market cache"}:
+        return "Local market cache"
     return make_provider(name).name
+
+
+def resolve_provider_symbol(name: str, ticker: str, options: dict[str, Any] | None = None) -> str:
+    normalized = name.strip().lower()
+    options = options or {}
+    if normalized == "stooq":
+        provider = make_provider("stooq", options)
+        if isinstance(provider, StooqProvider):
+            return provider.stooq_symbol(ticker)
+    if normalized in {"cache", "local_cache", "local market cache"}:
+        return ticker
+    return ticker
