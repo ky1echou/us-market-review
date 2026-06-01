@@ -13,9 +13,9 @@ market:
     - yfinance
     - stooq
 
-  # 备用源代码映射。Stooq 对指数使用自己的代码，ETF/股票默认自动转为 xxx.us。
   provider_options:
     stooq:
+      # Stooq 备用源代码映射。ETF/股票通常是 xxx.us，这里显式列出核心标的，便于排查。
       symbol_map:
         ^GSPC: ^spx
         ^IXIC: ^ndq
@@ -23,7 +23,32 @@ market:
         ^RUT: ^rut
         ^SOX: ^sox
         ^VIX: ^vix
+        ^TNX: 10usy.b
+        SPY: spy.us
+        QQQ: qqq.us
+        SMH: smh.us
+        SOXX: soxx.us
+        IWM: iwm.us
+        XLK: xlk.us
+        XLE: xle.us
+        XLF: xlf.us
+        XLV: xlv.us
+        NVDA: nvda.us
+        AMD: amd.us
+        AVGO: avgo.us
+        MSFT: msft.us
+        GOOGL: googl.us
+        META: meta.us
+        AMZN: amzn.us
+        AAPL: aapl.us
+        TSLA: tsla.us
         BTC-USD: btcusd
+    twelve_data:
+      api_key_env: TWELVE_DATA_API_KEY
+    alpha_vantage:
+      api_key_env: ALPHA_VANTAGE_API_KEY
+    polygon:
+      api_key_env: POLYGON_API_KEY
 
   period: 90d
   interval: 1d
@@ -36,7 +61,7 @@ market:
   cache_dir: data/processed/market_cache
   cache_max_age_hours: 168
 
-  # 实时行情成功率低于该阈值时，不生成正式 PDF，只推送失败提示。
+  # 行情可用率低于该阈值时，不生成正式 Markdown/PDF，只推送失败提示。
   min_success_ratio: 0.7
 
   benchmarks:
