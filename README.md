@@ -9,6 +9,14 @@
 3. Yahoo Finance via `yfinance`
 4. 本地缓存
 
+FMP 当前使用 stable endpoint：
+
+```text
+quote: https://financialmodelingprep.com/stable/quote?symbol=AAPL&apikey=...
+batch quote: https://financialmodelingprep.com/stable/batch-quote?symbols=AAPL,MSFT,NVDA&apikey=...
+historical EOD: https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=AAPL&apikey=...
+```
+
 如果没有配置 `FMP_API_KEY`，程序会自动跳过 FMP，不会报错。行情可用率低于 70% 时，系统不会生成正式 Markdown/PDF，也不会推送空报告，只会向 Telegram 发送状态提示。
 
 ## 一键安装
@@ -53,19 +61,33 @@ FEISHU_SECRET=
 
 不要把任何 Token、Webhook、API Key、SSH 私钥写进代码或 README。
 
-## 行情源诊断
+## FMP 诊断
 
-只测试 10 个核心标的，不会请求完整日报股票池：
+优先用这个最小诊断命令，只请求 AAPL、MSFT、NVDA：
 
 ```bash
 cd /opt/us-market-review
 source .venv/bin/activate
-python -m src.provider_check --provider fmp --config config.yaml
-python -m src.provider_check --provider all --config config.yaml
+python -m src.provider_check --provider fmp --symbols AAPL,MSFT,NVDA --config config.yaml
 cat logs/provider_check.log
 ```
 
-默认测试：SPY、QQQ、DIA、IWM、NVDA、MSFT、AAPL、AMD、AVGO、TSLA。输出会显示每个 provider 是否启用、成功数量、失败数量、失败原因，以及每个 ticker 实际请求使用的 symbol。诊断日志不会打印 `FMP_API_KEY`。
+输出会显示：
+
+- `FMP_API_KEY exists=yes/no`
+- key 长度和去空格后长度
+- key 前后是否有空格
+- 每个 symbol 使用的 endpoint 类型
+- HTTP status code
+- JSON 类型和前 300 个字符预览，且不会打印完整 API key
+- `quote_parse_success` 与 `historical_parse_success`
+- 失败分类：`missing_api_key`、`invalid_api_key`、`permission_denied`、`rate_limited`、`network_error`、`schema_parse_error`、`empty_response`
+
+完整 provider 链路诊断：
+
+```bash
+python -m src.provider_check --provider all --config config.yaml
+```
 
 ## 手动测试
 
@@ -74,7 +96,7 @@ cd /opt/us-market-review
 source .venv/bin/activate
 python test_send.py
 python -m src.health_check --config config.yaml
-python -m src.provider_check --provider fmp --config config.yaml
+python -m src.provider_check --provider fmp --symbols AAPL,MSFT,NVDA --config config.yaml
 bash run_daily.sh
 tail -n 120 logs/daily.log
 ```
@@ -105,7 +127,13 @@ SERVER_SSH_KEY
 FMP_API_KEY
 ```
 
-部署时会保留服务器上的 `.env`，并只更新或追加 `.env` 里的 `FMP_API_KEY` 这一行，不会覆盖 Telegram/飞书配置。
+部署时会保留服务器上的 `.env`，并只更新或追加 `.env` 里的 `FMP_API_KEY` 这一行，不会覆盖 Telegram/飞书配置。部署步骤会打印 `FMP_API_KEY` 是否写入服务器 `.env` 以及长度，但不会打印 key 内容。
+
+每次 push 后，请在 GitHub Actions 的 `Health check over SSH` 步骤查看 FMP 诊断输出。该步骤会运行：
+
+```bash
+python -m src.provider_check --provider fmp --symbols AAPL,MSFT,NVDA --config config.yaml
+```
 
 如需手动从 GitHub Actions 跑一次正式日报：
 
