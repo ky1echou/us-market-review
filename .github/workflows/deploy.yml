@@ -46,15 +46,17 @@ jobs:
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: |
           set -euo pipefail
+          FMP_API_KEY_B64="$(printf '%s' "${FMP_API_KEY:-}" | base64 -w 0)"
 
           ssh \
             -i ~/.ssh/us-market-review-deploy-key \
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=20 \
             -o TCPKeepAlive=yes \
-            "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+            "${SERVER_USER}@${SERVER_HOST}" "FMP_API_KEY_B64='${FMP_API_KEY_B64}' bash -s" <<'REMOTE'
           set -euo pipefail
 
           cd /opt/us-market-review
@@ -66,6 +68,25 @@ jobs:
           git fetch origin
           git reset --hard origin/main
           cp /tmp/us-market-review.env.bak .env || true
+
+          if [ -n "${FMP_API_KEY_B64:-}" ]; then
+            FMP_API_KEY_VALUE="$(printf '%s' "${FMP_API_KEY_B64}" | base64 -d)"
+            touch .env
+            tmp_env="$(mktemp)"
+            awk -v key="${FMP_API_KEY_VALUE}" '
+              BEGIN { updated = 0 }
+              /^FMP_API_KEY=/ { print "FMP_API_KEY=" key; updated = 1; next }
+              { print }
+              END { if (updated == 0) print "FMP_API_KEY=" key }
+            ' .env > "${tmp_env}"
+            cat "${tmp_env}" > .env
+            rm -f "${tmp_env}"
+            unset FMP_API_KEY_VALUE
+            echo "FMP_API_KEY has been configured in server .env"
+          else
+            echo "FMP_API_KEY secret is not configured; existing server .env is left unchanged."
+          fi
+          unset FMP_API_KEY_B64
 
           bash scripts/install_ubuntu.sh
           REMOTE
@@ -93,7 +114,7 @@ jobs:
           fi
 
           "$PYTHON_BIN" -m src.health_check --config config.yaml
-          "$PYTHON_BIN" -m src.provider_check --provider stooq --config config.yaml --tickers SPY,QQQ,DIA,IWM,NVDA || true
+          "$PYTHON_BIN" -m src.provider_check --provider fmp --config config.yaml --tickers SPY,QQQ,DIA,IWM,NVDA || true
           echo "Recent provider check log:"
           tail -n 80 logs/provider_check.log || true
           echo "Recent server log:"
