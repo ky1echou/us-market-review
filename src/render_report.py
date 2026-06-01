@@ -19,8 +19,6 @@ from .fetch_news import fetch_news
 from .prompt_builder import build_markdown_report
 from .send_report import (
     PushResult,
-    feishu_enabled,
-    send_feishu_message,
     send_outputs,
     send_telegram_message,
     telegram_enabled,
@@ -28,6 +26,21 @@ from .send_report import (
 
 
 MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。"
+REPORT_QUALITY_FAILURE_MESSAGE = "正式报告生成质量校验失败，未发送报告文件，请检查 logs/daily.log。"
+FORBIDDEN_REPORT_TERMS = [
+    "Too Many Requests",
+    "no cache fallback available",
+    "attempt 1/",
+    "attempt 1 of",
+    "抓取异常",
+    "数据审计",
+    "Traceback",
+    "HTTPError",
+    "ReadTimeout",
+    "ConnectionError",
+    "Python",
+    "N/A",
+]
 
 
 def slug_date(timezone_name: str) -> str:
@@ -278,42 +291,49 @@ def push_alerts_from_run(warnings: list[str]) -> list[str]:
 def market_failure_status_message(market_data: dict[str, Any]) -> str:
     metadata = market_data.get("metadata", {})
     total = int(metadata.get("total_count") or 0)
-    success = int(metadata.get("live_success_count") or 0)
-    failed = max(total - success, 0)
-    success_ratio = float(metadata.get("live_success_ratio") or 0.0) * 100
+    success = int(metadata.get("success_count") or 0)
+    live_success = int(metadata.get("live_success_count") or 0)
+    cache_success = int(metadata.get("cache_success_count") or 0)
+    failed = int(metadata.get("failed_count") or max(total - success, 0))
+    success_ratio = float(metadata.get("success_ratio") or 0.0) * 100
     return "\n".join(
         [
             MARKET_FAILURE_MESSAGE,
             f"行情成功数量: {success}/{total}",
             f"行情失败数量: {failed}",
             f"行情成功率: {success_ratio:.1f}%",
-            f"数据源: {metadata.get('source', 'N/A')}",
-            f"获取时间: {metadata.get('fetched_at', 'N/A')}",
+            f"实时获取数量: {live_success}",
+            f"缓存降级数量: {cache_success}",
+            f"数据源: {metadata.get('source') or '未披露'}",
+            f"获取时间: {metadata.get('fetched_at') or '未披露'}",
         ]
     )
 
 
 def send_market_failure_alert(market_data: dict[str, Any]) -> list[PushResult]:
     message = market_failure_status_message(market_data)
-    results: list[PushResult] = []
     if telegram_enabled():
-        results.append(send_telegram_message(message))
-    else:
-        results.append(PushResult("telegram", False, False, "disabled"))
-
-    if feishu_enabled():
-        results.append(send_feishu_message(message))
-    else:
-        results.append(PushResult("feishu", False, False, "disabled"))
-    return results
+        return [send_telegram_message(message)]
+    return [PushResult("telegram", False, False, "disabled")]
 
 
 def formal_report_allowed(market_data: dict[str, Any]) -> bool:
     metadata = market_data.get("metadata", {})
     total = int(metadata.get("total_count") or 0)
-    live_success_ratio = float(metadata.get("live_success_ratio") or 0.0)
+    success_ratio = float(metadata.get("success_ratio") or 0.0)
     min_success_ratio = float(metadata.get("min_success_ratio") or 0.7)
-    return total > 0 and live_success_ratio >= min_success_ratio
+    explicit_flag = metadata.get("formal_report_allowed")
+    if explicit_flag is not None:
+        return bool(explicit_flag) and total > 0
+    return total > 0 and success_ratio >= min_success_ratio
+
+
+def validate_report_text(markdown_text: str) -> str | None:
+    lower_text = markdown_text.lower()
+    for term in FORBIDDEN_REPORT_TERMS:
+        if term.lower() in lower_text:
+            return f"正式报告包含禁止内容: {term}"
+    return None
 
 
 def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[Path | None, Path | None, list[str], list[PushResult]]:
@@ -329,7 +349,13 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
         logger.warning("行情质量警告: %s", warning)
     for asset in market_data.get("assets", []):
         if asset.get("error"):
-            logger.warning("行情失败或降级: ticker=%s from_cache=%s provider=%s reason=%s", asset.get("ticker"), asset.get("from_cache"), asset.get("source", {}).get("provider"), asset.get("error"))
+            logger.warning(
+                "行情失败或降级: ticker=%s from_cache=%s provider=%s reason=%s",
+                asset.get("ticker"),
+                asset.get("from_cache"),
+                asset.get("source", {}).get("provider"),
+                asset.get("error"),
+            )
 
     if not formal_report_allowed(market_data):
         message = market_failure_status_message(market_data)
@@ -345,6 +371,15 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
         logger.warning("新闻失败: source=%s reason=%s", error.get("source"), error.get("error"))
 
     markdown_text = build_markdown_report(config, market_data, news_data)
+    quality_error = validate_report_text(markdown_text)
+    if quality_error:
+        logger.error("报告质量校验失败: %s", quality_error)
+        result = send_telegram_message(REPORT_QUALITY_FAILURE_MESSAGE) if telegram_enabled() else PushResult("telegram", False, False, "disabled")
+        push_results = [result]
+        log_push_results(logger, push_results)
+        logger.info("运行结束: report_quality_failed_no_files_sent")
+        return None, None, [REPORT_QUALITY_FAILURE_MESSAGE], push_results
+
     markdown_path, pdf_path, warnings = write_outputs(config, markdown_text)
     logger.info("报告生成路径: markdown=%s", markdown_path)
     if pdf_path:
