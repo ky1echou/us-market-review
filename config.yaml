@@ -35,13 +35,6 @@ market:
         IWM: IWM
         SMH: SMH
         SOXX: SOXX
-        XLK: XLK
-        XLF: XLF
-        XLE: XLE
-        XLV: XLV
-        TLT: TLT
-        GLD: GLD
-        USO: USO
         NVDA: NVDA
         MSFT: MSFT
         AAPL: AAPL
@@ -72,13 +65,6 @@ market:
         IWM: iwm.us
         SMH: smh.us
         SOXX: soxx.us
-        XLK: xlk.us
-        XLF: xlf.us
-        XLE: xle.us
-        XLV: xlv.us
-        TLT: tlt.us
-        GLD: gld.us
-        USO: uso.us
         NVDA: nvda.us
         MSFT: msft.us
         AAPL: aapl.us
@@ -104,7 +90,8 @@ market:
   provider_check_period: 30d
   interval: 1d
 
-  request_delay_sec: 1.0
+  # FMP 第一阶段禁用 batch quote，正式日报逐个 symbol 请求。
+  request_delay_sec: 0.3
   retry_count: 1
   retry_backoff_sec: 4.0
 
@@ -113,85 +100,92 @@ market:
   cache_max_age_hours: 168
   cache_max_trading_days: 3
 
-  # 行情可用率低于该阈值时，不生成正式 Markdown/PDF，只推送失败提示。
+  # 核心池行情可用率低于该阈值时，不生成正式 Markdown/PDF，只推送失败提示。
   min_success_ratio: 0.7
 
-  # 第一阶段正式报告只抓 MVP 核心池，避免覆盖过宽拖垮成功率。
+  # 第一阶段正式报告只抓 FMP 最容易支持的核心池，避免扩展 ETF/宏观资产拖垮成功率。
   benchmarks:
     - ticker: SPY
       name: 标普500ETF
+      required: true
     - ticker: QQQ
       name: 纳斯达克100ETF
+      required: true
     - ticker: DIA
       name: 道琼斯ETF
+      required: true
     - ticker: IWM
       name: 罗素2000ETF
+      required: true
 
   sector_etfs:
     - ticker: SMH
       name: 半导体ETF
+      required: true
     - ticker: SOXX
       name: 半导体ETF
-    - ticker: XLK
-      name: 科技
-    - ticker: XLF
-      name: 金融
-    - ticker: XLE
-      name: 能源
-    - ticker: XLV
-      name: 医疗保健
+      required: true
 
   key_stocks:
     - ticker: NVDA
       name: 英伟达
       theme: AI算力
+      required: true
     - ticker: MSFT
       name: 微软
       theme: AI软件
+      required: true
     - ticker: AAPL
       name: 苹果
       theme: 科技龙头
+      required: true
     - ticker: AMZN
       name: 亚马逊
       theme: 云计算/消费
+      required: true
     - ticker: GOOGL
       name: Alphabet
       theme: AI应用
+      required: true
     - ticker: META
       name: Meta
       theme: AI广告
+      required: true
     - ticker: TSLA
       name: 特斯拉
       theme: 电动车/机器人
+      required: true
     - ticker: AMD
       name: AMD
       theme: AI芯片
+      required: true
     - ticker: AVGO
       name: 博通
       theme: AI网络/ASIC
+      required: true
     - ticker: MU
       name: 美光
       theme: AI存储/HBM
+      required: true
     - ticker: MRVL
       name: Marvell
       theme: AI网络/ASIC
+      required: true
     - ticker: ARM
       name: Arm
       theme: AI芯片IP
+      required: true
     - ticker: SNOW
       name: Snowflake
       theme: AI数据云
+      required: true
     - ticker: NOW
       name: ServiceNow
       theme: AI软件/SaaS
+      required: true
 
-  macro_assets:
-    - ticker: TLT
-      name: 20年期以上美债ETF
-    - ticker: GLD
-      name: 黄金ETF
-    - ticker: USO
-      name: 原油ETF
+  # 第二阶段再恢复 TLT/GLD/USO 等宏观资产；扩展池失败不阻止正式报告。
+  macro_assets: []
 
 news:
   lookback_hours: 36
