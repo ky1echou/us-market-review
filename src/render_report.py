@@ -257,10 +257,11 @@ def write_outputs(config: dict[str, Any], markdown_text: str) -> tuple[Path, Pat
 def market_fetch_summary(market_data: dict[str, Any]) -> str:
     metadata = market_data.get("metadata", {})
     return (
-        f"行情成功 {metadata.get('success_count', 0)}/{metadata.get('total_count', 0)}，"
+        f"核心行情成功 {metadata.get('success_count', 0)}/{metadata.get('total_count', 0)}，"
         f"实时 {metadata.get('live_success_count', 0)}，"
         f"缓存 {metadata.get('cache_success_count', 0)}，"
-        f"失败 {metadata.get('failed_count', 0)}"
+        f"失败 {metadata.get('failed_count', 0)}，"
+        f"全池 {metadata.get('all_success_count', metadata.get('success_count', 0))}/{metadata.get('all_total_count', metadata.get('total_count', 0))}"
     )
 
 
@@ -288,6 +289,26 @@ def push_alerts_from_run(warnings: list[str]) -> list[str]:
     return alerts
 
 
+def compact_list(values: list[Any], limit: int = 30) -> str:
+    clean = [str(value) for value in values if str(value)]
+    if not clean:
+        return "无"
+    if len(clean) <= limit:
+        return ", ".join(clean)
+    return ", ".join(clean[:limit]) + f" 等 {len(clean)} 项"
+
+
+def compact_failed_details(details: list[dict[str, Any]], limit: int = 30) -> str:
+    items = []
+    for item in details:
+        ticker = item.get("ticker") or "UNKNOWN"
+        reason = item.get("reason") or "quote_failed"
+        quote = "Q✓" if item.get("quote_success") else "Q×"
+        hist = "H✓" if item.get("historical_success") else "H×"
+        items.append(f"{ticker}({reason},{quote},{hist})")
+    return compact_list(items, limit=limit)
+
+
 def market_failure_status_message(market_data: dict[str, Any]) -> str:
     metadata = market_data.get("metadata", {})
     total = int(metadata.get("total_count") or 0)
@@ -296,18 +317,27 @@ def market_failure_status_message(market_data: dict[str, Any]) -> str:
     cache_success = int(metadata.get("cache_success_count") or 0)
     failed = int(metadata.get("failed_count") or max(total - success, 0))
     success_ratio = float(metadata.get("success_ratio") or 0.0) * 100
-    return "\n".join(
-        [
-            MARKET_FAILURE_MESSAGE,
-            f"行情成功数量: {success}/{total}",
-            f"行情失败数量: {failed}",
-            f"行情成功率: {success_ratio:.1f}%",
-            f"实时获取数量: {live_success}",
-            f"缓存降级数量: {cache_success}",
-            f"数据源: {metadata.get('source') or '未披露'}",
-            f"获取时间: {metadata.get('fetched_at') or '未披露'}",
-        ]
-    )
+    lines = [
+        MARKET_FAILURE_MESSAGE,
+        f"行情成功数量: {success}/{total}",
+        f"行情失败数量: {failed}",
+        f"行情成功率: {success_ratio:.1f}%",
+        f"实时获取数量: {live_success}",
+        f"缓存降级数量: {cache_success}",
+        f"数据源: {metadata.get('source') or '未披露'}",
+        f"获取时间: {metadata.get('fetched_at') or '未披露'}",
+        f"成功 ticker: {compact_list(metadata.get('success_tickers', []))}",
+        f"失败 ticker: {compact_failed_details(metadata.get('failed_details', []))}",
+        f"quote 成功: {compact_list(metadata.get('quote_success_tickers', []))}",
+        f"historical EOD 成功: {compact_list(metadata.get('historical_success_tickers', []))}",
+    ]
+    quote_only = metadata.get("quote_only_tickers", [])
+    if quote_only:
+        lines.append(f"quote 成功但历史指标暂缺: {compact_list(quote_only)}")
+    extension_failed = metadata.get("extension_failed_details", [])
+    if extension_failed:
+        lines.append(f"扩展池失败: {compact_failed_details(extension_failed)}")
+    return "\n".join(lines)
 
 
 def send_market_failure_alert(market_data: dict[str, Any]) -> list[PushResult]:
@@ -344,17 +374,30 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
     logger.info("配置文件: %s", config_path)
 
     market_data = fetch_market_data(config)
+    metadata = market_data.get("metadata", {})
     logger.info("数据获取结果: %s", market_fetch_summary(market_data))
-    for warning in market_data.get("metadata", {}).get("warnings", []):
+    logger.info("行情成功ticker: %s", compact_list(metadata.get("success_tickers", []), limit=200))
+    logger.info("行情失败ticker: %s", compact_failed_details(metadata.get("failed_details", []), limit=200))
+    logger.info("quote成功ticker: %s", compact_list(metadata.get("quote_success_tickers", []), limit=200))
+    logger.info("historical成功ticker: %s", compact_list(metadata.get("historical_success_tickers", []), limit=200))
+    for warning in metadata.get("warnings", []):
         logger.warning("行情质量警告: %s", warning)
     for asset in market_data.get("assets", []):
         if asset.get("error"):
             logger.warning(
-                "行情失败或降级: ticker=%s from_cache=%s provider=%s reason=%s",
+                "行情失败或降级: ticker=%s from_cache=%s provider=%s failure_reason=%s reason=%s",
                 asset.get("ticker"),
                 asset.get("from_cache"),
                 asset.get("source", {}).get("provider"),
+                asset.get("failure_reason"),
                 asset.get("error"),
+            )
+        elif asset.get("indicator_reason"):
+            logger.info(
+                "行情quote可用但指标暂缺: ticker=%s provider=%s reason=%s",
+                asset.get("ticker"),
+                asset.get("source", {}).get("provider"),
+                asset.get("indicator_reason"),
             )
 
     if not formal_report_allowed(market_data):
