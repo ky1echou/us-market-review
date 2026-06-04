@@ -19,15 +19,50 @@ from .fetch_market import (
 from .market_data_provider import make_provider, provider_display_name, provider_is_enabled, resolve_provider_symbol
 
 
-CORE_TICKERS = ["SPY", "QQQ", "DIA", "IWM", "NVDA", "MSFT", "AAPL", "AMD", "AVGO", "TSLA"]
-LIVE_PROVIDERS = ["fmp", "stooq", "yfinance"]
-ALL_PROVIDERS = ["fmp", "stooq", "yfinance", "cache"]
+DEFAULT_FORMAL_TICKERS = [
+    "SPY",
+    "QQQ",
+    "DIA",
+    "IWM",
+    "SMH",
+    "SOXX",
+    "XLK",
+    "XLF",
+    "XLE",
+    "XLV",
+    "TLT",
+    "GLD",
+    "USO",
+    "VIX",
+    "US10Y",
+    "DXY",
+    "CPER",
+    "BTCUSD",
+    "NVDA",
+    "MSFT",
+    "AAPL",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA",
+    "AMD",
+    "AVGO",
+    "MU",
+    "MRVL",
+    "ARM",
+    "SNOW",
+    "NOW",
+]
+LIVE_PROVIDERS = ["fmp", "twelve_data", "stooq", "yfinance"]
+ALL_PROVIDERS = ["fmp", "twelve_data", "stooq", "yfinance", "cache"]
 ALLOWED_FAILURE_REASONS = {
+    "missing_api_key",
     "quote_failed",
     "historical_failed",
     "symbol_not_supported",
     "permission_denied",
     "rate_limited",
+    "network_error",
     "schema_parse_error",
     "empty_response",
 }
@@ -52,10 +87,14 @@ def normalize_failure_category(category: str | None, reason: str | None = None) 
     combined = f"{category_text} {reason_text}"
     if category_text in ALLOWED_FAILURE_REASONS:
         return category_text
+    if "api key" in combined and ("missing" in combined or "not configured" in combined or "empty" in combined):
+        return "missing_api_key"
     if "429" in combined or "rate limit" in combined or "rate_limited" in combined or "too many requests" in combined:
         return "rate_limited"
     if "403" in combined or "permission" in combined or "forbidden" in combined or "permission_denied" in combined:
         return "permission_denied"
+    if "network" in combined or "connection" in combined or "timeout" in combined or "temporarily unavailable" in combined:
+        return "network_error"
     if "schema" in combined or "parse" in combined or "missing price" in combined:
         return "schema_parse_error"
     if "no data" in combined or "not supported" in combined or "not found" in combined or "invalid symbol" in combined:
@@ -67,9 +106,8 @@ def normalize_failure_category(category: str | None, reason: str | None = None) 
 
 def parse_tickers(value: str | None) -> list[str]:
     if not value:
-        return CORE_TICKERS.copy()
-    tickers = [item.strip().upper() for item in value.split(",") if item.strip()]
-    return tickers or CORE_TICKERS.copy()
+        return []
+    return [item.strip().upper() for item in value.split(",") if item.strip()]
 
 
 def normalize_provider_name(provider: str) -> str:
@@ -77,7 +115,10 @@ def normalize_provider_name(provider: str) -> str:
     aliases = {
         "financial_modeling_prep": "fmp",
         "financialmodelingprep": "fmp",
+        "twelvedata": "twelve_data",
+        "twelve": "twelve_data",
         "local_cache": "cache",
+        "local market cache": "cache",
     }
     return aliases.get(normalized, normalized)
 
@@ -88,13 +129,20 @@ def providers_to_check(provider: str) -> list[str]:
         return ALL_PROVIDERS.copy()
     if normalized in ALL_PROVIDERS:
         return [normalized]
-    raise ValueError("--provider must be one of: all, fmp, stooq, yfinance, cache")
+    raise ValueError("--provider must be one of: all, fmp, twelve_data, stooq, yfinance, cache")
+
+
+def missing_key_reason(provider_name: str) -> tuple[str, str]:
+    if provider_name == "fmp":
+        return "FMP_API_KEY is not configured", "missing_api_key"
+    if provider_name == "twelve_data":
+        return "TWELVE_DATA_API_KEY is not configured", "missing_api_key"
+    return "provider is disabled", "quote_failed"
 
 
 def disabled_provider_result(provider_name: str, tickers: list[str], provider_options: dict[str, Any]) -> dict[str, Any]:
+    reason, failure_category = missing_key_reason(provider_name)
     rows = []
-    reason = "FMP_API_KEY is not configured" if provider_name == "fmp" else "provider is disabled"
-    failure_category = "missing_api_key" if provider_name == "fmp" else "quote_failed"
     for ticker in tickers:
         rows.append(
             {
@@ -184,6 +232,17 @@ def check_fmp_provider(
     }
 
 
+def fetch_quote_if_available(provider: Any, ticker: str) -> tuple[bool, str]:
+    fetch_quote = getattr(provider, "fetch_quote", None)
+    if not callable(fetch_quote):
+        return False, ""
+    try:
+        fetch_quote(ticker)
+        return True, ""
+    except Exception as exc:  # noqa: BLE001 - diagnostics should keep going.
+        return False, truncate_reason(str(exc))
+
+
 def check_live_provider(
     provider_name: str,
     tickers: list[str],
@@ -235,6 +294,7 @@ def check_live_provider(
         if index > 0 and request_delay_sec > 0:
             time.sleep(request_delay_sec)
         symbol = resolve_provider_symbol(provider_name, ticker, options)
+        quote_ok, quote_reason = fetch_quote_if_available(provider, ticker)
         try:
             frame = provider.fetch_history(ticker, period, interval)
             if frame is None or frame.empty:
@@ -249,28 +309,46 @@ def check_live_provider(
                     "latest": str(frame.index.max()),
                     "reason": "",
                     "failure_category": "",
-                    "quote_parse_success": True,
+                    "quote_parse_success": True if not callable(getattr(provider, "fetch_quote", None)) else quote_ok,
                     "historical_parse_success": True,
                     "historical_failure_category": "",
                 }
             )
         except Exception as exc:  # noqa: BLE001 - diagnostic should continue.
-            failed += 1
-            reason = truncate_reason(str(exc))
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "symbol": symbol,
-                    "status": "failed",
-                    "rows": 0,
-                    "latest": "",
-                    "reason": reason,
-                    "failure_category": normalize_failure_category("", reason),
-                    "quote_parse_success": False,
-                    "historical_parse_success": False,
-                    "historical_failure_category": "",
-                }
-            )
+            history_reason = truncate_reason(str(exc))
+            if quote_ok:
+                success += 1
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "symbol": symbol,
+                        "status": "ok",
+                        "rows": 1,
+                        "latest": "",
+                        "reason": "",
+                        "failure_category": "",
+                        "quote_parse_success": True,
+                        "historical_parse_success": False,
+                        "historical_failure_category": normalize_failure_category("historical_failed", history_reason),
+                    }
+                )
+            else:
+                failed += 1
+                reason = quote_reason or history_reason
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "symbol": symbol,
+                        "status": "failed",
+                        "rows": 0,
+                        "latest": "",
+                        "reason": reason,
+                        "failure_category": normalize_failure_category("", reason),
+                        "quote_parse_success": False,
+                        "historical_parse_success": False,
+                        "historical_failure_category": normalize_failure_category("historical_failed", history_reason),
+                    }
+                )
     return {
         "provider": provider_display_name(provider_name),
         "provider_key": provider_name,
@@ -415,11 +493,15 @@ def fmp_result_failed(results: list[dict[str, Any]], selected_providers: list[st
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Check FMP, Stooq, yfinance, and local cache with a small ticker set.")
-    parser.add_argument("--provider", default="all", help="all, fmp, stooq, yfinance, or cache")
+    parser = argparse.ArgumentParser(description="Check market data providers against the formal report ticker universe.")
+    parser.add_argument("--provider", default="all", help="all, fmp, twelve_data, stooq, yfinance, or cache")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--tickers", default="", help="Optional comma-separated ticker list. Defaults to 10 core tickers.")
-    parser.add_argument("--symbols", default="", help="Alias for --tickers, useful for FMP symbol diagnostics.")
+    parser.add_argument(
+        "--tickers",
+        default="",
+        help="Optional comma-separated ticker list. Defaults to the formal report universe in config.yaml.",
+    )
+    parser.add_argument("--symbols", default="", help="Alias for --tickers, useful for provider symbol diagnostics.")
     parser.add_argument("--universe", action="store_true", help="Use the formal report ticker universe from config.yaml.")
     parser.add_argument("--json", action="store_true", help="Print JSON instead of text.")
     args = parser.parse_args()
@@ -427,10 +509,11 @@ def main() -> None:
     config = load_config(args.config)
     market = config.get("market", {})
     provider_options = market.get("provider_options", {}) if isinstance(market.get("provider_options", {}), dict) else {}
-    if args.universe:
-        tickers = [str(item["ticker"]) for item in universe_from_config(config)]
+    explicit_tickers = parse_tickers(args.symbols or args.tickers)
+    if explicit_tickers:
+        tickers = explicit_tickers
     else:
-        tickers = parse_tickers(args.symbols or args.tickers)
+        tickers = [str(item["ticker"]) for item in universe_from_config(config)] or DEFAULT_FORMAL_TICKERS.copy()
     selected_providers = providers_to_check(args.provider)
     period = str(market.get("provider_check_period", market.get("period", "90d")))
     interval = str(market.get("interval", "1d"))
