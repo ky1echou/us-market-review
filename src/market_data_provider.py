@@ -19,7 +19,7 @@ class ProviderResult:
 
 
 @dataclass
-class FMPQuote:
+class MarketQuote:
     symbol: str
     price: float
     previous_close: float | None
@@ -29,11 +29,18 @@ class FMPQuote:
     raw: dict[str, Any]
 
 
-class FMPProviderError(Exception):
+FMPQuote = MarketQuote
+
+
+class MarketProviderError(Exception):
     def __init__(self, category: str, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
+
+
+class FMPProviderError(MarketProviderError):
+    pass
 
 
 class MarketDataProvider(Protocol):
@@ -98,6 +105,40 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def classify_http_error(status_code: int, text: str) -> str:
+    lower = text.lower()
+    if status_code == 429 or "rate limit" in lower or "too many" in lower or ("limit" in lower and "exceed" in lower):
+        return "rate_limited"
+    if status_code in {401, 402} or "invalid api" in lower or "invalid key" in lower:
+        return "invalid_api_key"
+    if status_code == 403 or "forbidden" in lower or "permission" in lower or "not available" in lower:
+        return "permission_denied"
+    if status_code >= 400:
+        return "network_error"
+    return "schema_parse_error"
+
+
+def quote_to_frame(quote: MarketQuote, provider_key: str, quote_only: bool = True) -> pd.DataFrame:
+    previous_close = quote.previous_close
+    if previous_close is None and quote.change is not None:
+        previous_close = quote.price - quote.change
+    if previous_close is None and quote.change_percent not in (None, -100):
+        previous_close = quote.price / (1 + quote.change_percent / 100)
+
+    today = utc_now_naive().normalize()
+    rows: list[dict[str, Any]] = []
+    if previous_close not in (None, 0):
+        rows.append({"Date": today - pd.Timedelta(days=1), "Close": previous_close, "Volume": None})
+    rows.append({"Date": today, "Close": quote.price, "Volume": quote.volume})
+    frame = normalize_history_frame(pd.DataFrame(rows))
+    frame.attrs["quote_success"] = True
+    frame.attrs["provider_symbol"] = quote.symbol
+    frame.attrs[f"{provider_key}_symbol"] = quote.symbol
+    frame.attrs["quote_only"] = quote_only
+    frame.attrs[f"{provider_key}_quote_only"] = quote_only
+    return frame
+
+
 class FMPProvider:
     name = "Financial Modeling Prep"
     base_url = "https://financialmodelingprep.com/stable"
@@ -109,6 +150,8 @@ class FMPProvider:
         "^DJI": "DIA",
         "^RUT": "IWM",
         "^SOX": "SMH",
+        "^VIX": "^VIX",
+        "^TNX": "^TNX",
         "SPY": "SPY",
         "QQQ": "QQQ",
         "DIA": "DIA",
@@ -122,6 +165,12 @@ class FMPProvider:
         "TLT": "TLT",
         "GLD": "GLD",
         "USO": "USO",
+        "CPER": "CPER",
+        "VIX": "^VIX",
+        "US10Y": "^TNX",
+        "DXY": "DX-Y.NYB",
+        "BTCUSD": "BTCUSD",
+        "BTC-USD": "BTCUSD",
         "NVDA": "NVDA",
         "AMD": "AMD",
         "AVGO": "AVGO",
@@ -155,7 +204,8 @@ class FMPProvider:
         self.timeout = int(timeout or 20)
         self.base_url = (base_url or self.base_url).rstrip("/")
         self.session = requests.Session()
-        self.quote_cache: dict[str, FMPQuote] = {}
+        self.quote_cache: dict[str, MarketQuote] = {}
+        self.prefetch_error: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -202,18 +252,6 @@ class FMPProvider:
         query = "&".join(f"{key}={value}" for key, value in visible.items())
         return f"{self.base_url}/{path.lstrip('/')}?{query}"
 
-    def _classify_response_error(self, status_code: int, text: str) -> str:
-        lower = text.lower()
-        if status_code == 429 or "rate limit" in lower or "limit" in lower and "exceed" in lower:
-            return "rate_limited"
-        if status_code in {401, 402} or "invalid api" in lower or "invalid key" in lower:
-            return "invalid_api_key"
-        if status_code == 403 or "forbidden" in lower or "permission" in lower or "not available" in lower:
-            return "permission_denied"
-        if status_code >= 400:
-            return "network_error"
-        return "schema_parse_error"
-
     def _request_json(self, endpoint_type: str, path: str, params: dict[str, Any]) -> tuple[Any, int, str]:
         if not self.enabled:
             raise FMPProviderError("missing_api_key", "FMP_API_KEY is not configured")
@@ -231,7 +269,7 @@ class FMPProvider:
 
         text = response.text or ""
         if response.status_code >= 400:
-            category = self._classify_response_error(response.status_code, text)
+            category = classify_http_error(response.status_code, text)
             raise FMPProviderError(category, f"{endpoint_type}: HTTP {response.status_code}", response.status_code)
 
         try:
@@ -244,7 +282,7 @@ class FMPProvider:
         if isinstance(payload, dict):
             message = payload.get("Error Message") or payload.get("error") or payload.get("message")
             if message:
-                category = self._classify_response_error(response.status_code, str(message))
+                category = classify_http_error(response.status_code, str(message))
                 raise FMPProviderError(category, f"{endpoint_type}: {message}", response.status_code)
         return payload, response.status_code, text
 
@@ -261,7 +299,7 @@ class FMPProvider:
             preview = preview[: limit - 3] + "..."
         return json_type, preview
 
-    def _quote_from_payload(self, payload: Any, symbol: str) -> FMPQuote:
+    def _quote_from_payload(self, payload: Any, symbol: str) -> MarketQuote:
         rows = payload if isinstance(payload, list) else [payload]
         rows = [row for row in rows if isinstance(row, dict)]
         if not rows:
@@ -277,7 +315,7 @@ class FMPProvider:
         change = safe_float(row.get("change") or row.get("changes"))
         change_percent = safe_float(row.get("changesPercentage") or row.get("changePercentage") or row.get("changePercent"))
         volume = safe_float(row.get("volume"))
-        return FMPQuote(
+        return MarketQuote(
             symbol=str(row.get("symbol") or symbol).upper(),
             price=price,
             previous_close=previous_close,
@@ -287,7 +325,7 @@ class FMPProvider:
             raw=row,
         )
 
-    def fetch_quote(self, ticker: str) -> FMPQuote:
+    def fetch_quote(self, ticker: str) -> MarketQuote:
         symbol = self.fmp_symbol(ticker)
         if symbol in self.quote_cache:
             return self.quote_cache[symbol]
@@ -296,7 +334,7 @@ class FMPProvider:
         self.quote_cache[symbol] = quote
         return quote
 
-    def prefetch_quotes(self, tickers: list[str]) -> dict[str, FMPQuote]:
+    def prefetch_quotes(self, tickers: list[str]) -> dict[str, MarketQuote]:
         if not self.enabled:
             return {}
 
@@ -312,7 +350,11 @@ class FMPProvider:
             chunk = symbols[start : start + self.quote_batch_size]
             if not chunk:
                 continue
-            payload, _, _ = self._request_json("batch_quote", "batch-quote", {"symbols": ",".join(chunk)})
+            try:
+                payload, _, _ = self._request_json("batch_quote", "batch-quote", {"symbols": ",".join(chunk)})
+            except FMPProviderError as exc:
+                self.prefetch_error = f"{exc.category}: {exc}"
+                raise
             rows = payload if isinstance(payload, list) else [payload]
             for row in rows:
                 if not isinstance(row, dict):
@@ -326,22 +368,10 @@ class FMPProvider:
                     continue
         return self.quote_cache
 
-    def quote_to_frame(self, quote: FMPQuote) -> pd.DataFrame:
-        previous_close = quote.previous_close
-        if previous_close is None and quote.change is not None:
-            previous_close = quote.price - quote.change
-        if previous_close is None and quote.change_percent not in (None, -100):
-            previous_close = quote.price / (1 + quote.change_percent / 100)
-
-        today = utc_now_naive().normalize()
-        rows: list[dict[str, Any]] = []
-        if previous_close not in (None, 0):
-            rows.append({"Date": today - pd.Timedelta(days=1), "Close": previous_close, "Volume": None})
-        rows.append({"Date": today, "Close": quote.price, "Volume": quote.volume})
-        frame = normalize_history_frame(pd.DataFrame(rows))
-        frame.attrs["quote_success"] = True
-        frame.attrs["fmp_symbol"] = quote.symbol
+    def quote_to_frame(self, quote: MarketQuote) -> pd.DataFrame:
+        frame = quote_to_frame(quote, "fmp", quote_only=True)
         frame.attrs["fmp_quote_only"] = True
+        frame.attrs["fmp_symbol"] = quote.symbol
         return frame
 
     def _historical_rows(self, payload: Any) -> list[dict[str, Any]]:
@@ -391,7 +421,9 @@ class FMPProvider:
             cutoff = utc_now_naive() - pd.Timedelta(days=days + 5)
             frame = frame[frame.index >= cutoff]
         frame.attrs["quote_success"] = True
+        frame.attrs["provider_symbol"] = symbol
         frame.attrs["fmp_symbol"] = symbol
+        frame.attrs["quote_only"] = False
         frame.attrs["fmp_quote_only"] = False
         return frame
 
@@ -470,11 +502,149 @@ class FMPProvider:
         return result
 
 
-class YFinanceProvider:
-    name = "Yahoo Finance via yfinance"
+class TwelveDataProvider:
+    name = "Twelve Data"
+    base_url = "https://api.twelvedata.com"
+    default_symbol_map = {
+        "VIX": "VIX",
+        "US10Y": "TNX",
+        "DXY": "DXY",
+        "BTCUSD": "BTC/USD",
+        "BTC-USD": "BTC/USD",
+        "USO": "USO",
+        "GLD": "GLD",
+        "CPER": "CPER",
+    }
+
+    def __init__(
+        self,
+        symbol_map: dict[str, str] | None = None,
+        api_key: str | None = None,
+        api_key_env: str = "TWELVE_DATA_API_KEY",
+        timeout: int = 20,
+        base_url: str | None = None,
+    ) -> None:
+        self.symbol_map = {**self.default_symbol_map, **(symbol_map or {})}
+        self.api_key_env = api_key_env or "TWELVE_DATA_API_KEY"
+        self.api_key_raw = api_key if api_key is not None else os.getenv(self.api_key_env, "")
+        self.api_key = str(self.api_key_raw).strip()
+        self.timeout = int(timeout or 20)
+        self.base_url = (base_url or self.base_url).rstrip("/")
+        self.session = requests.Session()
+        self.quote_cache: dict[str, MarketQuote] = {}
+
+    @classmethod
+    def is_configured(cls, options: dict[str, Any] | None = None) -> bool:
+        options = options or {}
+        api_key_env = str(options.get("api_key_env") or "TWELVE_DATA_API_KEY")
+        return bool(str(options.get("api_key") or os.getenv(api_key_env, "")).strip())
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    def td_symbol(self, ticker: str) -> str:
+        if ticker in self.symbol_map:
+            return self.symbol_map[ticker]
+        return ticker.strip().replace("-", "/").upper()
+
+    def _request_json(self, endpoint_type: str, path: str, params: dict[str, Any]) -> Any:
+        if not self.enabled:
+            raise MarketProviderError("missing_api_key", "TWELVE_DATA_API_KEY is not configured")
+        try:
+            response = self.session.get(
+                f"{self.base_url}/{path.lstrip('/')}",
+                params={**params, "apikey": self.api_key},
+                headers={"User-Agent": "us-market-review/0.1"},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise MarketProviderError("network_error", f"{endpoint_type}: {exc}") from exc
+        text = response.text or ""
+        if response.status_code >= 400:
+            raise MarketProviderError(classify_http_error(response.status_code, text), f"{endpoint_type}: HTTP {response.status_code}", response.status_code)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise MarketProviderError("schema_parse_error", f"{endpoint_type}: invalid JSON", response.status_code) from exc
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            message = str(payload.get("message") or payload.get("code") or "Twelve Data error")
+            raise MarketProviderError(classify_http_error(response.status_code, message), f"{endpoint_type}: {message}", response.status_code)
+        if payload in (None, "", [], {}):
+            raise MarketProviderError("empty_response", f"{endpoint_type}: empty response", response.status_code)
+        return payload
+
+    def fetch_quote(self, ticker: str) -> MarketQuote:
+        symbol = self.td_symbol(ticker)
+        if symbol in self.quote_cache:
+            return self.quote_cache[symbol]
+        payload = self._request_json("quote", "quote", {"symbol": symbol})
+        if not isinstance(payload, dict):
+            raise MarketProviderError("schema_parse_error", "quote: unexpected response schema")
+        price = safe_float(payload.get("close") or payload.get("price"))
+        if price is None:
+            raise MarketProviderError("schema_parse_error", "quote: missing close field")
+        previous_close = safe_float(payload.get("previous_close"))
+        change = safe_float(payload.get("change"))
+        change_percent = safe_float(payload.get("percent_change"))
+        volume = safe_float(payload.get("volume"))
+        quote = MarketQuote(symbol=symbol, price=price, previous_close=previous_close, change=change, change_percent=change_percent, volume=volume, raw=payload)
+        self.quote_cache[symbol] = quote
+        return quote
+
+    def fetch_historical_frame(self, ticker: str, period: str) -> pd.DataFrame:
+        symbol = self.td_symbol(ticker)
+        days = period_to_days(period) or 90
+        outputsize = max(30, min(days + 10, 5000))
+        payload = self._request_json("time_series", "time_series", {"symbol": symbol, "interval": "1day", "outputsize": outputsize})
+        rows = payload.get("values") if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or not rows:
+            raise MarketProviderError("empty_response", "time_series: empty values")
+        frame = pd.DataFrame(rows).rename(
+            columns={"datetime": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
+        )
+        keep = [column for column in ["Date", "Open", "High", "Low", "Close", "Volume"] if column in frame.columns]
+        frame = frame[keep].copy()
+        for column in ["Open", "High", "Low", "Close", "Volume"]:
+            if column in frame.columns:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = normalize_history_frame(frame)
+        frame.attrs["quote_success"] = True
+        frame.attrs["provider_symbol"] = symbol
+        frame.attrs["twelve_data_symbol"] = symbol
+        frame.attrs["quote_only"] = False
+        return frame
 
     def fetch_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
-        frame = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+        if interval not in {"1d", "1D", "d", "D"}:
+            raise ValueError("Twelve Data provider only supports daily history")
+        quote = self.fetch_quote(ticker)
+        try:
+            return self.fetch_historical_frame(ticker, period)
+        except MarketProviderError as exc:
+            frame = quote_to_frame(quote, "twelve_data", quote_only=True)
+            frame.attrs["historical_error_category"] = exc.category
+            frame.attrs["historical_error"] = str(exc)
+            return frame
+
+
+class YFinanceProvider:
+    name = "Yahoo Finance via yfinance"
+    default_symbol_map = {
+        "VIX": "^VIX",
+        "US10Y": "^TNX",
+        "DXY": "DX-Y.NYB",
+        "BTCUSD": "BTC-USD",
+    }
+
+    def __init__(self, symbol_map: dict[str, str] | None = None) -> None:
+        self.symbol_map = {**self.default_symbol_map, **(symbol_map or {})}
+
+    def yf_symbol(self, ticker: str) -> str:
+        return self.symbol_map.get(ticker, ticker)
+
+    def fetch_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
+        frame = yf.Ticker(self.yf_symbol(ticker)).history(period=period, interval=interval, auto_adjust=False)
         return normalize_history_frame(frame)
 
 
@@ -504,6 +674,12 @@ class StooqProvider:
         "TLT": "tlt.us",
         "GLD": "gld.us",
         "USO": "uso.us",
+        "CPER": "cper.us",
+        "VIX": "^vix",
+        "US10Y": "10usy.b",
+        "DXY": "dx.f",
+        "BTCUSD": "btcusd",
+        "BTC-USD": "btcusd",
         "NVDA": "nvda.us",
         "AMD": "amd.us",
         "AVGO": "avgo.us",
@@ -518,7 +694,6 @@ class StooqProvider:
         "ARM": "arm.us",
         "SNOW": "snow.us",
         "NOW": "now.us",
-        "BTC-USD": "btcusd",
     }
 
     def __init__(self, symbol_map: dict[str, str] | None = None) -> None:
@@ -573,17 +748,27 @@ def make_provider(name: str, options: dict[str, Any] | None = None) -> MarketDat
             timeout=int(options.get("timeout") or 20),
             base_url=options.get("base_url") if isinstance(options, dict) else None,
         )
+    if normalized in {"twelve_data", "twelvedata"}:
+        symbol_map = options.get("symbol_map") if isinstance(options, dict) else None
+        return TwelveDataProvider(
+            symbol_map=symbol_map if isinstance(symbol_map, dict) else None,
+            api_key=options.get("api_key") if isinstance(options, dict) else None,
+            api_key_env=str(options.get("api_key_env") or "TWELVE_DATA_API_KEY"),
+            timeout=int(options.get("timeout") or 20),
+            base_url=options.get("base_url") if isinstance(options, dict) else None,
+        )
     if normalized == "yfinance":
-        return YFinanceProvider()
+        symbol_map = options.get("symbol_map") if isinstance(options, dict) else None
+        return YFinanceProvider(symbol_map=symbol_map if isinstance(symbol_map, dict) else None)
     if normalized == "stooq":
         symbol_map = options.get("symbol_map") if isinstance(options, dict) else None
         return StooqProvider(symbol_map=symbol_map if isinstance(symbol_map, dict) else None)
     if normalized in {"cache", "local_cache", "local market cache"}:
         raise NotImplementedError("Cache is handled by fetch_market.py after live providers fail.")
-    if normalized in {"twelve_data", "twelvedata", "alpha_vantage", "alphavantage", "polygon"}:
+    if normalized in {"alpha_vantage", "alphavantage", "polygon"}:
         raise NotImplementedError(
             f"Market provider '{name}' is configured but not implemented yet. "
-            "The provider abstraction is ready for Twelve Data, Alpha Vantage, and Polygon."
+            "The provider abstraction is ready for Alpha Vantage and Polygon."
         )
     raise ValueError(f"Unsupported market provider: {name}")
 
@@ -593,6 +778,8 @@ def provider_is_enabled(name: str, options: dict[str, Any] | None = None) -> boo
     options = options or {}
     if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
         return FMPProvider.is_configured(options)
+    if normalized in {"twelve_data", "twelvedata"}:
+        return TwelveDataProvider.is_configured(options)
     return True
 
 
@@ -600,6 +787,8 @@ def provider_display_name(name: str) -> str:
     normalized = name.strip().lower()
     if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
         return FMPProvider.name
+    if normalized in {"twelve_data", "twelvedata"}:
+        return TwelveDataProvider.name
     if normalized in {"cache", "local_cache", "local market cache"}:
         return "Local market cache"
     return make_provider(name).name
@@ -608,17 +797,21 @@ def provider_display_name(name: str) -> str:
 def resolve_provider_symbol(name: str, ticker: str, options: dict[str, Any] | None = None) -> str:
     normalized = name.strip().lower()
     options = options or {}
+    symbol_map = options.get("symbol_map") if isinstance(options.get("symbol_map"), dict) else None
     if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
-        provider = FMPProvider(
-            symbol_map=options.get("symbol_map") if isinstance(options.get("symbol_map"), dict) else None,
-            api_key_env=str(options.get("api_key_env") or "FMP_API_KEY"),
-            base_url=options.get("base_url") if isinstance(options, dict) else None,
-        )
+        provider = FMPProvider(symbol_map=symbol_map, api_key_env=str(options.get("api_key_env") or "FMP_API_KEY"), base_url=options.get("base_url") if isinstance(options, dict) else None)
         return provider.fmp_symbol(ticker)
+    if normalized in {"twelve_data", "twelvedata"}:
+        provider = TwelveDataProvider(symbol_map=symbol_map, api_key_env=str(options.get("api_key_env") or "TWELVE_DATA_API_KEY"), base_url=options.get("base_url") if isinstance(options, dict) else None)
+        return provider.td_symbol(ticker)
     if normalized == "stooq":
         provider = make_provider("stooq", options)
         if isinstance(provider, StooqProvider):
             return provider.stooq_symbol(ticker)
+    if normalized == "yfinance":
+        provider = make_provider("yfinance", options)
+        if isinstance(provider, YFinanceProvider):
+            return provider.yf_symbol(ticker)
     if normalized in {"cache", "local_cache", "local market cache"}:
         return ticker
     return ticker
