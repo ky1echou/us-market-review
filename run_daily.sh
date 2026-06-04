@@ -20,7 +20,7 @@ CONFIG_PATH="${CONFIG_PATH:-${ENV_CONFIG_PATH:-config.yaml}}"
 LOG_FILE="${LOG_FILE:-${ENV_LOG_FILE:-logs/daily.log}}"
 LOCK_FILE="${LOCK_FILE:-${ENV_LOCK_FILE:-logs/run_daily.lock}}"
 LOCK_PID_FILE="${LOCK_FILE}.pid"
-RUN_DAILY_TIMEOUT="${RUN_DAILY_TIMEOUT:-${ENV_RUN_TIMEOUT:-20m}}"
+RUN_DAILY_TIMEOUT="${RUN_DAILY_TIMEOUT:-${ENV_RUN_TIMEOUT:-45m}}"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 mkdir -p "$(dirname "$LOCK_FILE")"
