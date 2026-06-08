@@ -56,6 +56,10 @@ else:
 PY
 }
 
+notify_timeout() {
+  "${PY_CMD[@]}" -m src.timeout_alert --config "$CONFIG_PATH" --timeout "$RUN_DAILY_TIMEOUT" >> "$LOG_FILE" 2>&1 || true
+}
+
 if [ ! -f "$CONFIG_PATH" ]; then
   echo "[$(timestamp)] failure reason=Config file not found: $CONFIG_PATH" >> "$LOG_FILE"
   exit 1
@@ -108,6 +112,7 @@ if [ "$status" -eq 0 ]; then
   echo "[$(timestamp)] run_daily.sh finish status=success" >> "$LOG_FILE"
 elif [ "$status" -eq 124 ]; then
   echo "[$(timestamp)] run_daily.sh finish status=failed reason=timeout timeout=$RUN_DAILY_TIMEOUT" >> "$LOG_FILE"
+  notify_timeout
 else
   echo "[$(timestamp)] run_daily.sh finish status=failed exit_code=$status" >> "$LOG_FILE"
 fi
