@@ -10,7 +10,11 @@ from typing import Any
 
 from .fetch_market import (
     cache_path,
+    call_with_timeout,
     configured_provider_order,
+    critical_group_results,
+    effective_provider_order,
+    error_category,
     load_cache,
     load_config,
     provider_options_for,
@@ -20,52 +24,17 @@ from .market_data_provider import make_provider, provider_display_name, provider
 
 
 DEFAULT_FORMAL_TICKERS = [
-    "SPY",
-    "QQQ",
-    "DIA",
-    "IWM",
-    "SMH",
-    "SOXX",
-    "XLK",
-    "XLF",
-    "XLE",
-    "XLV",
-    "TLT",
-    "GLD",
-    "USO",
-    "VIX",
-    "US10Y",
-    "DXY",
-    "CPER",
-    "BTCUSD",
-    "NVDA",
-    "MSFT",
-    "AAPL",
-    "AMZN",
-    "GOOGL",
-    "META",
-    "TSLA",
-    "AMD",
-    "AVGO",
-    "MU",
-    "MRVL",
-    "ARM",
-    "SNOW",
-    "NOW",
+    "SPY", "QQQ", "DIA", "IWM", "SMH", "SOXX", "XLK", "XLF", "XLE", "XLV", "TLT", "GLD", "USO",
+    "VIX", "US10Y", "DXY", "CPER", "BTCUSD", "NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA",
+    "AMD", "AVGO", "MU", "MRVL", "ARM", "SNOW", "NOW",
 ]
 LIVE_PROVIDERS = ["fmp", "twelve_data", "stooq", "yfinance"]
 ALL_PROVIDERS = ["fmp", "twelve_data", "stooq", "yfinance", "cache"]
 ALLOWED_FAILURE_REASONS = {
-    "missing_api_key",
-    "quote_failed",
-    "historical_failed",
-    "symbol_not_supported",
-    "permission_denied",
-    "rate_limited",
-    "network_error",
-    "schema_parse_error",
-    "empty_response",
+    "missing_api_key", "invalid_api_key", "payment_required", "provider_permission_denied", "quote_failed", "historical_failed",
+    "symbol_not_supported", "permission_denied", "rate_limited", "network_error", "schema_parse_error", "empty_response", "provider_timeout",
 }
+HISTORICAL_SAMPLE = ["AAPL", "MSFT", "NVDA"]
 
 
 def log_path() -> Path:
@@ -87,14 +56,16 @@ def normalize_failure_category(category: str | None, reason: str | None = None) 
     combined = f"{category_text} {reason_text}"
     if category_text in ALLOWED_FAILURE_REASONS:
         return category_text
+    if "402" in combined or "payment_required" in combined:
+        return "payment_required"
     if "api key" in combined and ("missing" in combined or "not configured" in combined or "empty" in combined):
         return "missing_api_key"
-    if "429" in combined or "rate limit" in combined or "rate_limited" in combined or "too many requests" in combined:
+    if "429" in combined or "rate limit" in combined or "too many requests" in combined:
         return "rate_limited"
-    if "403" in combined or "permission" in combined or "forbidden" in combined or "permission_denied" in combined:
-        return "permission_denied"
+    if "403" in combined or "provider_permission" in combined or "permission" in combined or "forbidden" in combined:
+        return "provider_permission_denied"
     if "network" in combined or "connection" in combined or "timeout" in combined or "temporarily unavailable" in combined:
-        return "network_error"
+        return "network_error" if "timeout" not in combined else "provider_timeout"
     if "schema" in combined or "parse" in combined or "missing price" in combined:
         return "schema_parse_error"
     if "no data" in combined or "not supported" in combined or "not found" in combined or "invalid symbol" in combined:
@@ -112,14 +83,7 @@ def parse_tickers(value: str | None) -> list[str]:
 
 def normalize_provider_name(provider: str) -> str:
     normalized = provider.strip().lower()
-    aliases = {
-        "financial_modeling_prep": "fmp",
-        "financialmodelingprep": "fmp",
-        "twelvedata": "twelve_data",
-        "twelve": "twelve_data",
-        "local_cache": "cache",
-        "local market cache": "cache",
-    }
+    aliases = {"financial_modeling_prep": "fmp", "financialmodelingprep": "fmp", "twelvedata": "twelve_data", "twelve": "twelve_data", "local_cache": "cache", "local market cache": "cache"}
     return aliases.get(normalized, normalized)
 
 
@@ -132,344 +96,170 @@ def providers_to_check(provider: str) -> list[str]:
     raise ValueError("--provider must be one of: all, fmp, twelve_data, stooq, yfinance, cache")
 
 
-def missing_key_reason(provider_name: str) -> tuple[str, str]:
-    if provider_name == "fmp":
-        return "FMP_API_KEY is not configured", "missing_api_key"
-    if provider_name == "twelve_data":
-        return "TWELVE_DATA_API_KEY is not configured", "missing_api_key"
-    return "provider is disabled", "quote_failed"
-
-
 def disabled_provider_result(provider_name: str, tickers: list[str], provider_options: dict[str, Any]) -> dict[str, Any]:
-    reason, failure_category = missing_key_reason(provider_name)
-    rows = []
-    for ticker in tickers:
-        rows.append(
-            {
-                "ticker": ticker,
-                "symbol": resolve_provider_symbol(provider_name, ticker, provider_options_for(provider_options, provider_name)),
-                "status": "disabled",
-                "rows": 0,
-                "latest": "",
-                "reason": reason,
-                "failure_category": failure_category,
-                "quote_parse_success": False,
-                "historical_parse_success": False,
-                "historical_failure_category": "",
-            }
-        )
-    return {
-        "provider": provider_display_name(provider_name),
-        "provider_key": provider_name,
-        "enabled": False,
-        "success_count": 0,
-        "failed_count": len(tickers),
-        "items": rows,
-    }
-
-
-def historical_failure_from_endpoints(endpoints: list[dict[str, Any]]) -> str:
-    for endpoint in endpoints:
-        if endpoint.get("endpoint_type") == "historical_eod" and not endpoint.get("parse_success"):
-            return normalize_failure_category(endpoint.get("failure_category"), endpoint.get("failure_reason"))
-    return ""
-
-
-def check_fmp_provider(
-    tickers: list[str],
-    provider_options: dict[str, Any],
-    request_delay_sec: float,
-) -> dict[str, Any]:
-    options = provider_options_for(provider_options, "fmp")
-    provider = make_provider("fmp", options)
-    rows: list[dict[str, Any]] = []
-    success = 0
-    failed = 0
-
-    for index, ticker in enumerate(tickers):
-        if index > 0 and request_delay_sec > 0:
-            time.sleep(request_delay_sec)
-        diagnostic = getattr(provider, "diagnose_symbol")(ticker)
-        quote_ok = bool(diagnostic.get("quote_parse_success"))
-        historical_ok = bool(diagnostic.get("historical_parse_success"))
-        endpoints = diagnostic.get("endpoints", [])
-        historical_failure_category = historical_failure_from_endpoints(endpoints)
-        if quote_ok:
-            success += 1
-            status = "ok"
-            reason = ""
-            failure_category = ""
-        else:
-            failed += 1
-            status = "failed"
-            failure_category = normalize_failure_category(diagnostic.get("failure_category"), "")
-            reason = failure_category
-        rows.append(
-            {
-                "ticker": ticker,
-                "symbol": diagnostic.get("symbol", ticker),
-                "status": status,
-                "rows": 1 if status == "ok" else 0,
-                "latest": "",
-                "reason": reason,
-                "failure_category": failure_category,
-                "quote_parse_success": quote_ok,
-                "historical_parse_success": historical_ok,
-                "historical_failure_category": historical_failure_category,
-                "endpoints": endpoints,
-            }
-        )
-
-    api_key_meta = getattr(provider, "api_key_metadata")()
-    return {
-        "provider": provider_display_name("fmp"),
-        "provider_key": "fmp",
-        "enabled": bool(api_key_meta.get("exists")),
-        "api_key": api_key_meta,
-        "success_count": success,
-        "failed_count": failed,
-        "items": rows,
-    }
-
-
-def fetch_quote_if_available(provider: Any, ticker: str) -> tuple[bool, str]:
-    fetch_quote = getattr(provider, "fetch_quote", None)
-    if not callable(fetch_quote):
-        return False, ""
-    try:
-        fetch_quote(ticker)
-        return True, ""
-    except Exception as exc:  # noqa: BLE001 - diagnostics should keep going.
-        return False, truncate_reason(str(exc))
-
-
-def check_live_provider(
-    provider_name: str,
-    tickers: list[str],
-    period: str,
-    interval: str,
-    provider_options: dict[str, Any],
-    request_delay_sec: float,
-) -> dict[str, Any]:
     if provider_name == "fmp":
-        return check_fmp_provider(tickers, provider_options, request_delay_sec)
+        reason, failure_category = "FMP_API_KEY is not configured", "missing_api_key"
+    elif provider_name == "twelve_data":
+        reason, failure_category = "TWELVE_DATA_API_KEY is not configured", "missing_api_key"
+    else:
+        reason, failure_category = "provider is disabled", "quote_failed"
+    rows = [
+        {
+            "ticker": ticker,
+            "symbol": resolve_provider_symbol(provider_name, ticker, provider_options_for(provider_options, provider_name)),
+            "status": "disabled",
+            "rows": 0,
+            "latest": "",
+            "reason": reason,
+            "failure_category": failure_category,
+            "quote_parse_success": False,
+            "historical_parse_success": False,
+            "historical_failure_category": "",
+        }
+        for ticker in tickers
+    ]
+    return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": False, "success_count": 0, "failed_count": len(tickers), "items": rows}
 
+
+def api_key_metadata(provider: Any, provider_name: str) -> dict[str, Any]:
+    metadata = getattr(provider, "api_key_metadata", None)
+    if callable(metadata):
+        return metadata()
+    if provider_name == "twelve_data":
+        raw = str(getattr(provider, "api_key_raw", "") or "")
+        trimmed = str(getattr(provider, "api_key", "") or "")
+        return {"env_name": "TWELVE_DATA_API_KEY", "exists": bool(trimmed), "length": len(raw), "trimmed_length": len(trimmed), "has_outer_whitespace": raw != raw.strip(), "loaded_from_dotenv": Path(".env").exists()}
+    return {}
+
+
+def provider_quote_check(provider: Any, provider_name: str, ticker: str, period: str, interval: str, timeout_sec: int) -> tuple[bool, bool, int, str, str]:
+    fetch_quote = getattr(provider, "fetch_quote", None)
+    if callable(fetch_quote):
+        try:
+            call_with_timeout(lambda: fetch_quote(ticker), timeout_sec, f"{provider.name} quote {ticker}")
+            historical_ok = False
+            if ticker in HISTORICAL_SAMPLE:
+                try:
+                    frame = call_with_timeout(lambda: provider.fetch_history(ticker, period, interval), timeout_sec, f"{provider.name} historical {ticker}")
+                    historical_ok = frame is not None and not frame.empty
+                except Exception:
+                    historical_ok = False
+            return True, historical_ok, 1, "", ""
+        except Exception as exc:  # noqa: BLE001
+            category = normalize_failure_category(error_category(exc), str(exc))
+            return False, False, 0, truncate_reason(str(exc)), category
+    try:
+        frame = call_with_timeout(lambda: provider.fetch_history(ticker, "5d", interval), timeout_sec, f"{provider.name} proxy {ticker}")
+        if frame is None or frame.empty:
+            raise ValueError("empty price history")
+        return True, True, int(len(frame)), "", ""
+    except Exception as exc:  # noqa: BLE001
+        category = normalize_failure_category(error_category(exc), str(exc))
+        return False, False, 0, truncate_reason(str(exc)), category
+
+
+def check_live_provider(provider_name: str, tickers: list[str], period: str, interval: str, provider_options: dict[str, Any], request_delay_sec: float, timeout_sec: int) -> dict[str, Any]:
     options = provider_options_for(provider_options, provider_name)
     if not provider_is_enabled(provider_name, options):
         return disabled_provider_result(provider_name, tickers, provider_options)
+    try:
+        provider = make_provider(provider_name, options)
+    except Exception as exc:  # noqa: BLE001
+        reason = truncate_reason(str(exc))
+        category = normalize_failure_category("", reason)
+        return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": True, "success_count": 0, "failed_count": len(tickers), "items": [{"ticker": ticker, "symbol": resolve_provider_symbol(provider_name, ticker, options), "status": "failed", "rows": 0, "latest": "", "reason": reason, "failure_category": category, "quote_parse_success": False, "historical_parse_success": False, "historical_failure_category": ""} for ticker in tickers]}
 
     rows: list[dict[str, Any]] = []
     success = 0
     failed = 0
-
-    try:
-        provider = make_provider(provider_name, options)
-    except Exception as exc:  # noqa: BLE001 - diagnostic should continue.
-        reason = truncate_reason(str(exc))
-        failure_category = normalize_failure_category("", reason)
-        return {
-            "provider": provider_display_name(provider_name),
-            "provider_key": provider_name,
-            "enabled": True,
-            "success_count": 0,
-            "failed_count": len(tickers),
-            "items": [
-                {
-                    "ticker": ticker,
-                    "symbol": resolve_provider_symbol(provider_name, ticker, options),
-                    "status": "failed",
-                    "rows": 0,
-                    "latest": "",
-                    "reason": reason,
-                    "failure_category": failure_category,
-                    "quote_parse_success": False,
-                    "historical_parse_success": False,
-                    "historical_failure_category": "",
-                }
-                for ticker in tickers
-            ],
-        }
-
     for index, ticker in enumerate(tickers):
         if index > 0 and request_delay_sec > 0:
             time.sleep(request_delay_sec)
         symbol = resolve_provider_symbol(provider_name, ticker, options)
-        quote_ok, quote_reason = fetch_quote_if_available(provider, ticker)
-        try:
-            frame = provider.fetch_history(ticker, period, interval)
-            if frame is None or frame.empty:
-                raise ValueError("empty price history")
+        quote_ok, historical_ok, row_count, reason, category = provider_quote_check(provider, provider_name, ticker, period, interval, timeout_sec)
+        if quote_ok:
             success += 1
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "symbol": symbol,
-                    "status": "ok",
-                    "rows": int(len(frame)),
-                    "latest": str(frame.index.max()),
-                    "reason": "",
-                    "failure_category": "",
-                    "quote_parse_success": True if not callable(getattr(provider, "fetch_quote", None)) else quote_ok,
-                    "historical_parse_success": True,
-                    "historical_failure_category": "",
-                }
-            )
-        except Exception as exc:  # noqa: BLE001 - diagnostic should continue.
-            history_reason = truncate_reason(str(exc))
-            if quote_ok:
-                success += 1
-                rows.append(
-                    {
-                        "ticker": ticker,
-                        "symbol": symbol,
-                        "status": "ok",
-                        "rows": 1,
-                        "latest": "",
-                        "reason": "",
-                        "failure_category": "",
-                        "quote_parse_success": True,
-                        "historical_parse_success": False,
-                        "historical_failure_category": normalize_failure_category("historical_failed", history_reason),
-                    }
-                )
-            else:
-                failed += 1
-                reason = quote_reason or history_reason
-                rows.append(
-                    {
-                        "ticker": ticker,
-                        "symbol": symbol,
-                        "status": "failed",
-                        "rows": 0,
-                        "latest": "",
-                        "reason": reason,
-                        "failure_category": normalize_failure_category("", reason),
-                        "quote_parse_success": False,
-                        "historical_parse_success": False,
-                        "historical_failure_category": normalize_failure_category("historical_failed", history_reason),
-                    }
-                )
-    return {
-        "provider": provider_display_name(provider_name),
-        "provider_key": provider_name,
-        "enabled": True,
-        "success_count": success,
-        "failed_count": failed,
-        "items": rows,
-    }
+            rows.append({"ticker": ticker, "symbol": symbol, "status": "ok", "rows": row_count, "latest": "", "reason": "", "failure_category": "", "quote_parse_success": True, "historical_parse_success": historical_ok, "historical_failure_category": "" if historical_ok or ticker not in HISTORICAL_SAMPLE else "historical_failed"})
+        else:
+            failed += 1
+            rows.append({"ticker": ticker, "symbol": symbol, "status": "failed", "rows": 0, "latest": "", "reason": reason or category, "failure_category": category or "quote_failed", "quote_parse_success": False, "historical_parse_success": False, "historical_failure_category": ""})
+    return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": True, "api_key": api_key_metadata(provider, provider_name), "success_count": success, "failed_count": failed, "items": rows}
 
 
-def check_cache_provider(
-    tickers: list[str],
-    period: str,
-    interval: str,
-    cache_dir: str,
-    cache_max_age_hours: int,
-    cache_max_trading_days: int,
-) -> dict[str, Any]:
+def check_cache_provider(tickers: list[str], period: str, interval: str, cache_dir: str, cache_max_age_hours: int, cache_max_trading_days: int) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     success = 0
     failed = 0
-
     for ticker in tickers:
         path = cache_path(cache_dir, ticker, period, interval)
         frame, error = load_cache(path, cache_max_age_hours, cache_max_trading_days)
         if not frame.empty:
             success += 1
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "symbol": str(path),
-                    "status": "ok",
-                    "rows": int(len(frame)),
-                    "latest": str(frame.index.max()),
-                    "reason": "",
-                    "failure_category": "",
-                    "quote_parse_success": True,
-                    "historical_parse_success": True,
-                    "historical_failure_category": "",
-                }
-            )
+            rows.append({"ticker": ticker, "symbol": str(path), "status": "ok", "rows": int(len(frame)), "latest": str(frame.index.max()), "reason": "", "failure_category": "", "quote_parse_success": True, "historical_parse_success": True, "historical_failure_category": ""})
         else:
             failed += 1
             reason = truncate_reason(error or "no cache fallback available")
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "symbol": str(path),
-                    "status": "failed",
-                    "rows": 0,
-                    "latest": "",
-                    "reason": reason,
-                    "failure_category": normalize_failure_category("", reason),
-                    "quote_parse_success": False,
-                    "historical_parse_success": False,
-                    "historical_failure_category": "",
-                }
-            )
-    return {
-        "provider": "Local market cache",
-        "provider_key": "cache",
-        "enabled": True,
-        "success_count": success,
-        "failed_count": failed,
-        "items": rows,
-    }
+            rows.append({"ticker": ticker, "symbol": str(path), "status": "failed", "rows": 0, "latest": "", "reason": reason, "failure_category": normalize_failure_category("", reason), "quote_parse_success": False, "historical_parse_success": False, "historical_failure_category": ""})
+    return {"provider": "Local market cache", "provider_key": "cache", "enabled": True, "success_count": success, "failed_count": failed, "items": rows}
 
 
-def render_text(results: list[dict[str, Any]], generated_at: str, period: str, interval: str, tickers: list[str]) -> str:
-    lines = [f"provider_check generated_at={generated_at} period={period} interval={interval} tickers={','.join(tickers)}"]
+def chain_coverage(results: list[dict[str, Any]], provider_order: list[str], tickers: list[str], critical_groups: dict[str, Any]) -> dict[str, Any]:
+    by_provider = {result["provider_key"]: {item["ticker"]: item for item in result.get("items", [])} for result in results}
+    success_tickers: list[str] = []
+    failed_details: list[dict[str, Any]] = []
+    provider_counts: dict[str, int] = {}
+    for ticker in tickers:
+        chosen: tuple[str, dict[str, Any]] | None = None
+        failure_reason = "quote_failed"
+        for provider_name in provider_order:
+            item = by_provider.get(provider_name, {}).get(ticker)
+            if not item:
+                continue
+            if item.get("status") == "ok":
+                chosen = (provider_name, item)
+                break
+            failure_reason = item.get("failure_category") or item.get("reason") or failure_reason
+        if chosen:
+            provider_name, _ = chosen
+            success_tickers.append(ticker)
+            provider_counts[provider_display_name(provider_name)] = provider_counts.get(provider_display_name(provider_name), 0) + 1
+        else:
+            failed_details.append({"ticker": ticker, "reason": failure_reason, "quote_success": False, "historical_success": False})
+    total = len(tickers)
+    success_ratio = len(success_tickers) / total if total else 0.0
+    pseudo_assets = [{"ticker": ticker, "last_close": 1.0 if ticker in success_tickers else None, "daily_change": 0.0 if ticker in success_tickers else None, "quote_success": ticker in success_tickers, "required": True} for ticker in tickers]
+    groups = critical_group_results(pseudo_assets, critical_groups)
+    return {"total_count": total, "success_count": len(success_tickers), "failed_count": len(failed_details), "success_ratio": success_ratio, "success_tickers": success_tickers, "failed_tickers": [item["ticker"] for item in failed_details], "failed_details": failed_details, "provider_counts": provider_counts, "critical_groups": groups, "critical_groups_passed": all(group.get("passed") for group in groups.values())}
+
+
+def render_text(results: list[dict[str, Any]], coverage: dict[str, Any], generated_at: str, period: str, interval: str, tickers: list[str]) -> str:
+    lines = [f"provider_check generated_at={generated_at} period={period} interval={interval} full_pool_total={len(tickers)} tickers={','.join(tickers)}"]
+    lines.append(f"chain_success={coverage.get('success_count', 0)}/{coverage.get('total_count', 0)} ratio={float(coverage.get('success_ratio') or 0.0) * 100:.1f}%")
+    lines.append(f"chain_success_tickers={','.join(coverage.get('success_tickers', []))}")
+    failed_text = ",".join(f"{item['ticker']}({item.get('reason') or 'quote_failed'})" for item in coverage.get("failed_details", []))
+    lines.append(f"chain_failed_tickers={failed_text}")
+    lines.append(f"chain_provider_counts={json.dumps(coverage.get('provider_counts', {}), ensure_ascii=False)}")
+    lines.append(f"critical_groups_passed={str(coverage.get('critical_groups_passed')).lower()} critical_groups={json.dumps(coverage.get('critical_groups', {}), ensure_ascii=False)}")
     for result in results:
         items = result["items"]
         success_tickers = [str(item["ticker"]) for item in items if item.get("status") == "ok"]
         failed_items = [item for item in items if item.get("status") != "ok"]
-        failed_text = ",".join(f"{item['ticker']}({item.get('failure_category') or item.get('reason') or 'quote_failed'})" for item in failed_items)
+        failed_provider_text = ",".join(f"{item['ticker']}({item.get('failure_category') or item.get('reason') or 'quote_failed'})" for item in failed_items)
         quote_success = [str(item["ticker"]) for item in items if item.get("quote_parse_success")]
         historical_success = [str(item["ticker"]) for item in items if item.get("historical_parse_success")]
         api_key = result.get("api_key") or {}
-        if result.get("provider_key") == "fmp":
-            lines.append(
-                "FMP_API_KEY "
-                f"exists={'yes' if api_key.get('exists') else 'no'} "
-                f"length={api_key.get('length', 0)} "
-                f"trimmed_length={api_key.get('trimmed_length', 0)} "
-                f"outer_whitespace={'yes' if api_key.get('has_outer_whitespace') else 'no'} "
-                f"loaded_from_dotenv={'yes' if api_key.get('loaded_from_dotenv') else 'no'}"
-            )
-        lines.append(
-            f"provider={result['provider']} enabled={str(result.get('enabled', True)).lower()} "
-            f"success={result['success_count']} failed={result['failed_count']}"
-        )
+        if result.get("provider_key") in {"fmp", "twelve_data"} and api_key:
+            lines.append(f"{api_key.get('env_name')} exists={'yes' if api_key.get('exists') else 'no'} length={api_key.get('length', 0)} trimmed_length={api_key.get('trimmed_length', 0)} outer_whitespace={'yes' if api_key.get('has_outer_whitespace') else 'no'} loaded_from_dotenv={'yes' if api_key.get('loaded_from_dotenv') else 'no'}")
+        lines.append(f"provider={result['provider']} enabled={str(result.get('enabled', True)).lower()} success={result['success_count']} failed={result['failed_count']}")
         lines.append(f"success_tickers={','.join(success_tickers)}")
-        lines.append(f"failed_tickers={failed_text}")
+        lines.append(f"failed_tickers={failed_provider_text}")
         lines.append(f"quote_success_tickers={','.join(quote_success)}")
-        lines.append(f"historical_success_tickers={','.join(historical_success)}")
+        lines.append(f"historical_sample_success_tickers={','.join(historical_success)}")
         for item in items:
             reason = f" reason={item['reason']}" if item.get("reason") else ""
             category = f" failure_category={item['failure_category']}" if item.get("failure_category") else ""
-            historical_category = (
-                f" historical_failure_category={item['historical_failure_category']}"
-                if item.get("historical_failure_category")
-                else ""
-            )
-            lines.append(
-                f"  ticker={item['ticker']} symbol={item['symbol']} status={item['status']} rows={item['rows']} latest={item['latest']}"
-                f" quote_success={'yes' if item.get('quote_parse_success') else 'no'}"
-                f" historical_success={'yes' if item.get('historical_parse_success') else 'no'}"
-                f"{category}{historical_category}{reason}"
-            )
-            if result.get("provider_key") == "fmp":
-                for endpoint in item.get("endpoints", []):
-                    lines.append(
-                        "    endpoint="
-                        f"{endpoint.get('endpoint_type')} "
-                        f"url={endpoint.get('url')} "
-                        f"http_status={endpoint.get('http_status')} "
-                        f"json_type={endpoint.get('json_type')} "
-                        f"parse_success={'yes' if endpoint.get('parse_success') else 'no'} "
-                        f"failure_category={endpoint.get('failure_category', '')} "
-                        f"preview={endpoint.get('preview', '')}"
-                    )
+            historical_category = f" historical_failure_category={item['historical_failure_category']}" if item.get("historical_failure_category") else ""
+            lines.append(f"  ticker={item['ticker']} symbol={item['symbol']} status={item['status']} rows={item['rows']} latest={item['latest']} quote_success={'yes' if item.get('quote_parse_success') else 'no'} historical_success={'yes' if item.get('historical_parse_success') else 'no'}{category}{historical_category}{reason}")
     return "\n".join(lines) + "\n"
 
 
@@ -496,11 +286,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Check market data providers against the formal report ticker universe.")
     parser.add_argument("--provider", default="all", help="all, fmp, twelve_data, stooq, yfinance, or cache")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument(
-        "--tickers",
-        default="",
-        help="Optional comma-separated ticker list. Defaults to the formal report universe in config.yaml.",
-    )
+    parser.add_argument("--tickers", default="", help="Optional comma-separated ticker list. Defaults to the formal report universe in config.yaml.")
     parser.add_argument("--symbols", default="", help="Alias for --tickers, useful for provider symbol diagnostics.")
     parser.add_argument("--universe", action="store_true", help="Use the formal report ticker universe from config.yaml.")
     parser.add_argument("--json", action="store_true", help="Print JSON instead of text.")
@@ -515,31 +301,29 @@ def main() -> None:
     else:
         tickers = [str(item["ticker"]) for item in universe_from_config(config)] or DEFAULT_FORMAL_TICKERS.copy()
     selected_providers = providers_to_check(args.provider)
+    configured_order = effective_provider_order(configured_provider_order(market), provider_options)
+    provider_order_for_coverage = [provider for provider in configured_order if provider in selected_providers]
+    if not provider_order_for_coverage:
+        provider_order_for_coverage = selected_providers
     period = str(market.get("provider_check_period", market.get("period", "90d")))
     interval = str(market.get("interval", "1d"))
-    request_delay_sec = float(market.get("request_delay_sec", 0.3))
+    request_delay_sec = float(market.get("provider_check_request_delay_sec", 0.05))
+    timeout_sec = int(market.get("provider_check_request_timeout_sec", min(int(market.get("provider_request_timeout_sec", 12)), 8)))
     cache_dir = str(market.get("cache_dir", "data/processed/market_cache"))
     cache_max_age_hours = int(market.get("cache_max_age_hours", 168))
     cache_max_trading_days = int(market.get("cache_max_trading_days", 3))
+    critical_groups = market.get("critical_groups") if isinstance(market.get("critical_groups"), dict) else {}
     generated_at = datetime.now().astimezone().isoformat(timespec="seconds")
 
     results: list[dict[str, Any]] = []
     for provider_name in selected_providers:
         if provider_name in LIVE_PROVIDERS:
-            results.append(check_live_provider(provider_name, tickers, period, interval, provider_options, request_delay_sec))
+            results.append(check_live_provider(provider_name, tickers, period, interval, provider_options, request_delay_sec, timeout_sec))
         elif provider_name == "cache":
             results.append(check_cache_provider(tickers, period, interval, cache_dir, cache_max_age_hours, cache_max_trading_days))
-
-    payload = {
-        "generated_at": generated_at,
-        "config": args.config,
-        "configured_provider_order": configured_provider_order(market),
-        "tickers": tickers,
-        "period": period,
-        "interval": interval,
-        "results": results,
-    }
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(results, generated_at, period, interval, tickers)
+    coverage = chain_coverage(results, provider_order_for_coverage, tickers, critical_groups)
+    payload = {"generated_at": generated_at, "config": args.config, "configured_provider_order": configured_provider_order(market), "provider_order_for_coverage": provider_order_for_coverage, "tickers": tickers, "period": period, "interval": interval, "coverage": coverage, "results": results}
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(results, coverage, generated_at, period, interval, tickers)
     write_log(text)
     print(text, end="")
     if fmp_result_failed(results, selected_providers):
