@@ -17,6 +17,7 @@ from .fetch_market import (
     error_category,
     load_cache,
     load_config,
+    provider_option_enabled,
     provider_options_for,
     universe_from_config,
 )
@@ -30,11 +31,11 @@ DEFAULT_FORMAL_TICKERS = [
 ]
 LIVE_PROVIDERS = ["fmp", "twelve_data", "stooq", "yfinance"]
 ALL_PROVIDERS = ["fmp", "twelve_data", "stooq", "yfinance", "cache"]
+HISTORICAL_SAMPLE = ["AAPL", "MSFT", "NVDA"]
 ALLOWED_FAILURE_REASONS = {
     "missing_api_key", "invalid_api_key", "payment_required", "provider_permission_denied", "quote_failed", "historical_failed",
     "symbol_not_supported", "permission_denied", "rate_limited", "network_error", "schema_parse_error", "empty_response", "provider_timeout",
 }
-HISTORICAL_SAMPLE = ["AAPL", "MSFT", "NVDA"]
 
 
 def log_path() -> Path:
@@ -65,7 +66,7 @@ def normalize_failure_category(category: str | None, reason: str | None = None) 
     if "403" in combined or "provider_permission" in combined or "permission" in combined or "forbidden" in combined:
         return "provider_permission_denied"
     if "network" in combined or "connection" in combined or "timeout" in combined or "temporarily unavailable" in combined:
-        return "network_error" if "timeout" not in combined else "provider_timeout"
+        return "provider_timeout" if "timeout" in combined else "network_error"
     if "schema" in combined or "parse" in combined or "missing price" in combined:
         return "schema_parse_error"
     if "no data" in combined or "not supported" in combined or "not found" in combined or "invalid symbol" in combined:
@@ -96,28 +97,25 @@ def providers_to_check(provider: str) -> list[str]:
     raise ValueError("--provider must be one of: all, fmp, twelve_data, stooq, yfinance, cache")
 
 
-def disabled_provider_result(provider_name: str, tickers: list[str], provider_options: dict[str, Any]) -> dict[str, Any]:
+def provider_enabled(provider_name: str, provider_options: dict[str, Any]) -> bool:
+    options = provider_options_for(provider_options, provider_name)
+    return provider_option_enabled(provider_name, options) and provider_is_enabled(provider_name, options)
+
+
+def disabled_reason(provider_name: str, provider_options: dict[str, Any]) -> tuple[str, str]:
+    options = provider_options_for(provider_options, provider_name)
+    if options.get("enabled") is False or (provider_name == "stooq" and not provider_option_enabled(provider_name, options)):
+        return "provider disabled by config", "provider_disabled"
     if provider_name == "fmp":
-        reason, failure_category = "FMP_API_KEY is not configured", "missing_api_key"
-    elif provider_name == "twelve_data":
-        reason, failure_category = "TWELVE_DATA_API_KEY is not configured", "missing_api_key"
-    else:
-        reason, failure_category = "provider is disabled", "quote_failed"
-    rows = [
-        {
-            "ticker": ticker,
-            "symbol": resolve_provider_symbol(provider_name, ticker, provider_options_for(provider_options, provider_name)),
-            "status": "disabled",
-            "rows": 0,
-            "latest": "",
-            "reason": reason,
-            "failure_category": failure_category,
-            "quote_parse_success": False,
-            "historical_parse_success": False,
-            "historical_failure_category": "",
-        }
-        for ticker in tickers
-    ]
+        return "FMP_API_KEY is not configured", "missing_api_key"
+    if provider_name == "twelve_data":
+        return "TWELVE_DATA_API_KEY is not configured", "missing_api_key"
+    return "provider is disabled", "quote_failed"
+
+
+def disabled_provider_result(provider_name: str, tickers: list[str], provider_options: dict[str, Any]) -> dict[str, Any]:
+    reason, failure_category = disabled_reason(provider_name, provider_options)
+    rows = [{"ticker": ticker, "symbol": resolve_provider_symbol(provider_name, ticker, provider_options_for(provider_options, provider_name)), "status": "disabled", "rows": 0, "latest": "", "reason": reason, "failure_category": failure_category, "quote_parse_success": False, "historical_parse_success": False, "historical_failure_category": ""} for ticker in tickers]
     return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": False, "success_count": 0, "failed_count": len(tickers), "items": rows}
 
 
@@ -158,10 +156,19 @@ def provider_quote_check(provider: Any, provider_name: str, ticker: str, period:
         return False, False, 0, truncate_reason(str(exc)), category
 
 
+def check_dry_provider(provider_name: str, tickers: list[str], provider_options: dict[str, Any], cache_dir: str, period: str, interval: str) -> dict[str, Any]:
+    enabled = provider_name == "cache" or provider_enabled(provider_name, provider_options)
+    rows: list[dict[str, Any]] = []
+    for ticker in tickers:
+        symbol = str(cache_path(cache_dir, ticker, period, interval)) if provider_name == "cache" else resolve_provider_symbol(provider_name, ticker, provider_options_for(provider_options, provider_name))
+        rows.append({"ticker": ticker, "symbol": symbol, "status": "mapped" if enabled else "disabled", "rows": 0, "latest": "", "reason": "" if enabled else disabled_reason(provider_name, provider_options)[0], "failure_category": "" if enabled else disabled_reason(provider_name, provider_options)[1], "quote_parse_success": enabled, "historical_parse_success": False, "historical_failure_category": ""})
+    return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": enabled, "dry_run": True, "success_count": len(tickers) if enabled else 0, "failed_count": 0 if enabled else len(tickers), "items": rows}
+
+
 def check_live_provider(provider_name: str, tickers: list[str], period: str, interval: str, provider_options: dict[str, Any], request_delay_sec: float, timeout_sec: int) -> dict[str, Any]:
-    options = provider_options_for(provider_options, provider_name)
-    if not provider_is_enabled(provider_name, options):
+    if not provider_enabled(provider_name, provider_options):
         return disabled_provider_result(provider_name, tickers, provider_options)
+    options = provider_options_for(provider_options, provider_name)
     try:
         provider = make_provider(provider_name, options)
     except Exception as exc:  # noqa: BLE001
@@ -215,14 +222,15 @@ def chain_coverage(results: list[dict[str, Any]], provider_order: list[str], tic
             item = by_provider.get(provider_name, {}).get(ticker)
             if not item:
                 continue
-            if item.get("status") == "ok":
+            if item.get("status") in {"ok", "mapped"}:
                 chosen = (provider_name, item)
                 break
             failure_reason = item.get("failure_category") or item.get("reason") or failure_reason
         if chosen:
             provider_name, _ = chosen
             success_tickers.append(ticker)
-            provider_counts[provider_display_name(provider_name)] = provider_counts.get(provider_display_name(provider_name), 0) + 1
+            display = provider_display_name(provider_name)
+            provider_counts[display] = provider_counts.get(display, 0) + 1
         else:
             failed_details.append({"ticker": ticker, "reason": failure_reason, "quote_success": False, "historical_success": False})
     total = len(tickers)
@@ -232,8 +240,9 @@ def chain_coverage(results: list[dict[str, Any]], provider_order: list[str], tic
     return {"total_count": total, "success_count": len(success_tickers), "failed_count": len(failed_details), "success_ratio": success_ratio, "success_tickers": success_tickers, "failed_tickers": [item["ticker"] for item in failed_details], "failed_details": failed_details, "provider_counts": provider_counts, "critical_groups": groups, "critical_groups_passed": all(group.get("passed") for group in groups.values())}
 
 
-def render_text(results: list[dict[str, Any]], coverage: dict[str, Any], generated_at: str, period: str, interval: str, tickers: list[str]) -> str:
-    lines = [f"provider_check generated_at={generated_at} period={period} interval={interval} full_pool_total={len(tickers)} tickers={','.join(tickers)}"]
+def render_text(results: list[dict[str, Any]], coverage: dict[str, Any], generated_at: str, period: str, interval: str, tickers: list[str], dry_run: bool) -> str:
+    mode = "dry_mapping" if dry_run else "live_quote"
+    lines = [f"provider_check mode={mode} generated_at={generated_at} period={period} interval={interval} full_pool_total={len(tickers)} tickers={','.join(tickers)}"]
     lines.append(f"chain_success={coverage.get('success_count', 0)}/{coverage.get('total_count', 0)} ratio={float(coverage.get('success_ratio') or 0.0) * 100:.1f}%")
     lines.append(f"chain_success_tickers={','.join(coverage.get('success_tickers', []))}")
     failed_text = ",".join(f"{item['ticker']}({item.get('reason') or 'quote_failed'})" for item in coverage.get("failed_details", []))
@@ -242,8 +251,8 @@ def render_text(results: list[dict[str, Any]], coverage: dict[str, Any], generat
     lines.append(f"critical_groups_passed={str(coverage.get('critical_groups_passed')).lower()} critical_groups={json.dumps(coverage.get('critical_groups', {}), ensure_ascii=False)}")
     for result in results:
         items = result["items"]
-        success_tickers = [str(item["ticker"]) for item in items if item.get("status") == "ok"]
-        failed_items = [item for item in items if item.get("status") != "ok"]
+        success_tickers = [str(item["ticker"]) for item in items if item.get("status") in {"ok", "mapped"}]
+        failed_items = [item for item in items if item.get("status") not in {"ok", "mapped"}]
         failed_provider_text = ",".join(f"{item['ticker']}({item.get('failure_category') or item.get('reason') or 'quote_failed'})" for item in failed_items)
         quote_success = [str(item["ticker"]) for item in items if item.get("quote_parse_success")]
         historical_success = [str(item["ticker"]) for item in items if item.get("historical_parse_success")]
@@ -289,6 +298,7 @@ def main() -> None:
     parser.add_argument("--tickers", default="", help="Optional comma-separated ticker list. Defaults to the formal report universe in config.yaml.")
     parser.add_argument("--symbols", default="", help="Alias for --tickers, useful for provider symbol diagnostics.")
     parser.add_argument("--universe", action="store_true", help="Use the formal report ticker universe from config.yaml.")
+    parser.add_argument("--dry-run", action="store_true", help="Check full-pool symbol mapping and provider enablement without live quote requests.")
     parser.add_argument("--json", action="store_true", help="Print JSON instead of text.")
     args = parser.parse_args()
 
@@ -296,15 +306,10 @@ def main() -> None:
     market = config.get("market", {})
     provider_options = market.get("provider_options", {}) if isinstance(market.get("provider_options", {}), dict) else {}
     explicit_tickers = parse_tickers(args.symbols or args.tickers)
-    if explicit_tickers:
-        tickers = explicit_tickers
-    else:
-        tickers = [str(item["ticker"]) for item in universe_from_config(config)] or DEFAULT_FORMAL_TICKERS.copy()
+    tickers = explicit_tickers or [str(item["ticker"]) for item in universe_from_config(config)] or DEFAULT_FORMAL_TICKERS.copy()
     selected_providers = providers_to_check(args.provider)
     configured_order = effective_provider_order(configured_provider_order(market), provider_options)
-    provider_order_for_coverage = [provider for provider in configured_order if provider in selected_providers]
-    if not provider_order_for_coverage:
-        provider_order_for_coverage = selected_providers
+    provider_order_for_coverage = [provider for provider in configured_order if provider in selected_providers] or selected_providers
     period = str(market.get("provider_check_period", market.get("period", "90d")))
     interval = str(market.get("interval", "1d"))
     request_delay_sec = float(market.get("provider_check_request_delay_sec", 0.05))
@@ -317,16 +322,18 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     for provider_name in selected_providers:
-        if provider_name in LIVE_PROVIDERS:
+        if args.dry_run:
+            results.append(check_dry_provider(provider_name, tickers, provider_options, cache_dir, period, interval))
+        elif provider_name in LIVE_PROVIDERS:
             results.append(check_live_provider(provider_name, tickers, period, interval, provider_options, request_delay_sec, timeout_sec))
         elif provider_name == "cache":
             results.append(check_cache_provider(tickers, period, interval, cache_dir, cache_max_age_hours, cache_max_trading_days))
     coverage = chain_coverage(results, provider_order_for_coverage, tickers, critical_groups)
-    payload = {"generated_at": generated_at, "config": args.config, "configured_provider_order": configured_provider_order(market), "provider_order_for_coverage": provider_order_for_coverage, "tickers": tickers, "period": period, "interval": interval, "coverage": coverage, "results": results}
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(results, coverage, generated_at, period, interval, tickers)
+    payload = {"generated_at": generated_at, "mode": "dry_mapping" if args.dry_run else "live_quote", "config": args.config, "configured_provider_order": configured_provider_order(market), "provider_order_for_coverage": provider_order_for_coverage, "tickers": tickers, "period": period, "interval": interval, "coverage": coverage, "results": results}
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n" if args.json else render_text(results, coverage, generated_at, period, interval, tickers, args.dry_run)
     write_log(text)
     print(text, end="")
-    if fmp_result_failed(results, selected_providers):
+    if not args.dry_run and fmp_result_failed(results, selected_providers):
         sys.exit(2)
 
 
