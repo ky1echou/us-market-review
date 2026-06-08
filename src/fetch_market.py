@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import signal
 import time
 from datetime import date, datetime, timedelta
@@ -16,35 +17,17 @@ import yaml
 from dotenv import load_dotenv
 
 from .indicators import summarize_price_frame
-from .market_data_provider import (
-    MarketProviderError,
-    make_provider,
-    provider_display_name,
-    provider_is_enabled,
-    quote_to_frame as provider_quote_to_frame,
-)
+from .market_data_provider import MarketProviderError, make_provider, provider_display_name, provider_is_enabled, quote_to_frame as provider_quote_to_frame
 
 
-DEFAULT_PROVIDER_ORDER = ["fmp", "twelve_data", "stooq", "yfinance", "cache"]
+DEFAULT_PROVIDER_ORDER = ["fmp", "twelve_data", "yfinance", "cache"]
 MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。"
 MARKET_TIMEOUT_MESSAGE = "us-market-review 运行超时，未生成正式美股复盘，请检查数据源。"
 DATA_SOURCE_UPGRADE_MESSAGE = "免费行情源无法满足完整报告，需要接入/升级正式数据源。"
 ALLOWED_FAILURE_REASONS = {
-    "quote_failed",
-    "historical_failed",
-    "symbol_not_supported",
-    "permission_denied",
-    "provider_permission_denied",
-    "payment_required",
-    "invalid_api_key",
-    "missing_api_key",
-    "rate_limited",
-    "network_error",
-    "schema_parse_error",
-    "empty_response",
-    "provider_timeout",
-    "ticker_timeout",
-    "market_fetch_timeout",
+    "quote_failed", "historical_failed", "symbol_not_supported", "permission_denied", "provider_permission_denied",
+    "payment_required", "invalid_api_key", "missing_api_key", "rate_limited", "network_error", "schema_parse_error",
+    "empty_response", "provider_timeout", "ticker_timeout", "market_fetch_timeout",
 }
 RETRYABLE_FAILURE_REASONS = {"rate_limited"}
 DEFAULT_CRITICAL_GROUPS = {
@@ -77,6 +60,13 @@ def env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def normalize_provider_name(name: str) -> str:
@@ -119,13 +109,24 @@ def provider_options_for(provider_options: dict[str, Any], provider_name: str) -
     return value if isinstance(value, dict) else {}
 
 
+def provider_option_enabled(provider_name: str, options: dict[str, Any]) -> bool:
+    if options.get("enabled") is False:
+        return False
+    if provider_name == "stooq" and not (options.get("enabled") is True or env_bool("ENABLE_STOOQ", False)):
+        return False
+    return True
+
+
 def effective_provider_order(provider_order: list[str], provider_options: dict[str, Any]) -> list[str]:
     effective: list[str] = []
     for provider_name in provider_order:
         normalized = normalize_provider_name(provider_name)
+        options = provider_options_for(provider_options, normalized)
         if normalized in effective:
             continue
-        if not provider_is_enabled(normalized, provider_options_for(provider_options, normalized)):
+        if not provider_option_enabled(normalized, options):
+            continue
+        if not provider_is_enabled(normalized, options):
             continue
         effective.append(normalized)
     if "cache" not in effective:
@@ -170,30 +171,29 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         market["market_data_provider_order"] = config_provider_order
     market["provider_chain"] = market["market_data_provider_order"]
 
-    if os.getenv("MARKET_REQUEST_DELAY_SEC"):
-        market["request_delay_sec"] = env_float("MARKET_REQUEST_DELAY_SEC", float(market.get("request_delay_sec", 0.2)))
-    if os.getenv("MARKET_RETRY_COUNT"):
-        market["retry_count"] = env_int("MARKET_RETRY_COUNT", int(market.get("retry_count", 2)))
-    if os.getenv("MARKET_RETRY_BACKOFF_SEC"):
-        market["retry_backoff_sec"] = env_float("MARKET_RETRY_BACKOFF_SEC", float(market.get("retry_backoff_sec", 30.0)))
-    if os.getenv("MARKET_PROVIDER_REQUEST_TIMEOUT_SEC"):
-        market["provider_request_timeout_sec"] = env_int("MARKET_PROVIDER_REQUEST_TIMEOUT_SEC", int(market.get("provider_request_timeout_sec", 12)))
-    if os.getenv("MARKET_PER_TICKER_TIMEOUT_SEC"):
-        market["per_ticker_timeout_sec"] = env_int("MARKET_PER_TICKER_TIMEOUT_SEC", int(market.get("per_ticker_timeout_sec", 60)))
-    if os.getenv("MARKET_FETCH_TIMEOUT_SEC"):
-        market["market_fetch_timeout_sec"] = env_int("MARKET_FETCH_TIMEOUT_SEC", int(market.get("market_fetch_timeout_sec", 1200)))
+    env_overrides = {
+        "MARKET_REQUEST_DELAY_SEC": ("request_delay_sec", env_float),
+        "MARKET_RETRY_COUNT": ("retry_count", env_int),
+        "MARKET_RETRY_BACKOFF_SEC": ("retry_backoff_sec", env_float),
+        "MARKET_PROVIDER_REQUEST_TIMEOUT_SEC": ("provider_request_timeout_sec", env_int),
+        "MARKET_PER_TICKER_TIMEOUT_SEC": ("per_ticker_timeout_sec", env_int),
+        "MARKET_FETCH_TIMEOUT_SEC": ("market_fetch_timeout_sec", env_int),
+        "TWELVE_DATA_BATCH_SIZE": ("twelve_data_batch_size", env_int),
+        "TWELVE_DATA_BATCH_SLEEP_SEC": ("twelve_data_batch_sleep_sec", env_int),
+        "TWELVE_DATA_RETRY_SLEEP_SEC": ("twelve_data_retry_sleep_sec", env_int),
+        "MARKET_CACHE_MAX_AGE_HOURS": ("cache_max_age_hours", env_int),
+        "MARKET_CACHE_MAX_TRADING_DAYS": ("cache_max_trading_days", env_int),
+        "MARKET_MIN_SUCCESS_RATIO": ("min_success_ratio", env_float),
+    }
+    for env_name, (key, parser) in env_overrides.items():
+        if os.getenv(env_name):
+            market[key] = parser(env_name, market.get(key))
     if os.getenv("MARKET_CACHE_DIR"):
         market["cache_dir"] = os.getenv("MARKET_CACHE_DIR")
     if os.getenv("MARKET_CACHE_SNAPSHOT_PATH"):
         market["cache_snapshot_path"] = os.getenv("MARKET_CACHE_SNAPSHOT_PATH")
     if os.getenv("MARKET_RUN_STATE_PATH"):
         market["run_state_path"] = os.getenv("MARKET_RUN_STATE_PATH")
-    if os.getenv("MARKET_CACHE_MAX_AGE_HOURS"):
-        market["cache_max_age_hours"] = env_int("MARKET_CACHE_MAX_AGE_HOURS", int(market.get("cache_max_age_hours", 168)))
-    if os.getenv("MARKET_CACHE_MAX_TRADING_DAYS"):
-        market["cache_max_trading_days"] = env_int("MARKET_CACHE_MAX_TRADING_DAYS", int(market.get("cache_max_trading_days", 5)))
-    if os.getenv("MARKET_MIN_SUCCESS_RATIO"):
-        market["min_success_ratio"] = env_float("MARKET_MIN_SUCCESS_RATIO", float(market.get("min_success_ratio", 0.9)))
     if os.getenv("ENABLE_PDF"):
         config.setdefault("report", {}).setdefault("pdf", {})
         config["report"]["pdf"]["enabled"] = os.getenv("ENABLE_PDF", "true").lower() == "true"
@@ -315,7 +315,7 @@ def error_category(exc: Exception) -> str:
     if isinstance(exc, ProviderCallTimeout):
         return "provider_timeout"
     text = str(exc).lower()
-    if "http 402" in text:
+    if "http 402" in text or "payment_required" in text:
         return "payment_required"
     if "http 429" in text or "too many" in text or "rate limit" in text:
         return "rate_limited"
@@ -334,11 +334,33 @@ def should_retry(category: str) -> bool:
     return category in RETRYABLE_FAILURE_REASONS
 
 
+def retry_after_from_text(text: str) -> float | None:
+    match = re.search(r"retry[_ -]?after[=: ]+(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
 def write_run_state(state: dict[str, Any], path: str | Path) -> None:
     run_state_path = Path(path)
     run_state_path.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     run_state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def throttle_twelve_data(throttle_state: dict[str, Any] | None, batch_size: int, batch_sleep_sec: int, deadline: float | None) -> None:
+    if not throttle_state or batch_size <= 0 or batch_sleep_sec <= 0:
+        return
+    count = int(throttle_state.get("request_count") or 0)
+    slept_after = int(throttle_state.get("slept_after") or 0)
+    if count > 0 and count % batch_size == 0 and slept_after != count:
+        sleep_seconds = min(float(batch_sleep_sec), seconds_left(deadline))
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+        throttle_state["slept_after"] = count
 
 
 def fetch_history_with_provider_order(
@@ -358,12 +380,23 @@ def fetch_history_with_provider_order(
     market_deadline: float | None = None,
     progress_state: dict[str, Any] | None = None,
     run_state_path: str | Path | None = None,
+    prefer_cache: bool = True,
+    twelve_data_throttle_state: dict[str, Any] | None = None,
+    twelve_data_batch_size: int = 3,
+    twelve_data_batch_sleep_sec: int = 90,
+    twelve_data_retry_sleep_sec: int = 90,
 ) -> tuple[pd.DataFrame, str | None, bool, str | None, str]:
     errors: list[str] = []
     ticker_cache_path = cache_path(cache_dir, ticker, period, interval)
     provider_instances = provider_instances or {}
     ticker_deadline = min(time.monotonic() + per_ticker_timeout_sec, market_deadline or time.monotonic() + per_ticker_timeout_sec)
     current_provider = ""
+
+    cache_error: str | None = None
+    if prefer_cache:
+        cached_frame, cache_error = load_cache(ticker_cache_path, cache_max_age_hours, cache_max_trading_days)
+        if not cached_frame.empty:
+            return cached_frame, None, True, None, "Local market cache"
 
     for provider_name in provider_order:
         if seconds_left(ticker_deadline) <= 0:
@@ -379,22 +412,27 @@ def fetch_history_with_provider_order(
                 write_run_state(progress_state, run_state_path)
 
         if normalized == "cache":
-            cached_frame, cache_error = load_cache(ticker_cache_path, cache_max_age_hours, cache_max_trading_days)
+            cached_frame, current_cache_error = load_cache(ticker_cache_path, cache_max_age_hours, cache_max_trading_days)
             if not cached_frame.empty:
                 return cached_frame, "; ".join(errors) if errors else None, True, None, "Local market cache"
-            errors.append(f"cache: {cache_error or 'no cache fallback available'}")
+            errors.append(f"cache: {current_cache_error or cache_error or 'no cache fallback available'}")
             continue
-        if not provider_is_enabled(normalized, provider_options_for(provider_options, normalized)):
+        options = provider_options_for(provider_options, normalized)
+        if not provider_option_enabled(normalized, options) or not provider_is_enabled(normalized, options):
             continue
 
         try:
-            provider = provider_instances.get(normalized) or make_provider(normalized, provider_options_for(provider_options, normalized))
+            provider = provider_instances.get(normalized) or make_provider(normalized, options)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{normalized}: {exc}")
             continue
 
         attempt = 1
         while attempt <= retry_count and seconds_left(ticker_deadline) > 0 and seconds_left(market_deadline) > 0:
+            if normalized == "twelve_data":
+                throttle_twelve_data(twelve_data_throttle_state, twelve_data_batch_size, twelve_data_batch_sleep_sec, market_deadline)
+                if twelve_data_throttle_state is not None:
+                    twelve_data_throttle_state["request_count"] = int(twelve_data_throttle_state.get("request_count") or 0) + 1
             request_timeout = min(float(provider_request_timeout_sec), seconds_left(ticker_deadline), seconds_left(market_deadline))
             try:
                 if normalized in {"fmp", "twelve_data"} and hasattr(provider, "fetch_quote"):
@@ -419,7 +457,13 @@ def fetch_history_with_provider_order(
                         write_run_state(progress_state, run_state_path)
                 if not should_retry(category) or attempt >= retry_count:
                     break
-                sleep_seconds = min(retry_backoff_sec * attempt, seconds_left(ticker_deadline), seconds_left(market_deadline))
+                retry_after = retry_after_from_text(str(exc))
+                base_sleep = retry_backoff_sec * attempt
+                if normalized == "twelve_data":
+                    base_sleep = max(float(twelve_data_retry_sleep_sec), retry_after or 0, base_sleep)
+                elif retry_after:
+                    base_sleep = max(base_sleep, retry_after)
+                sleep_seconds = min(base_sleep, seconds_left(ticker_deadline), seconds_left(market_deadline))
                 if sleep_seconds > 0:
                     time.sleep(sleep_seconds)
                 attempt += 1
@@ -486,14 +530,7 @@ def classify_failure_reason(asset: dict[str, Any]) -> str:
 
 def failure_detail(asset: dict[str, Any]) -> dict[str, Any]:
     source = asset.get("source", {}) if isinstance(asset.get("source"), dict) else {}
-    return {
-        "ticker": asset.get("ticker"),
-        "reason": asset.get("failure_reason") or classify_failure_reason(asset),
-        "quote_success": bool(asset.get("quote_success")),
-        "historical_success": bool(asset.get("historical_success")),
-        "provider": source.get("provider") or "",
-        "provider_symbol": source.get("provider_symbol") or asset.get("ticker"),
-    }
+    return {"ticker": asset.get("ticker"), "reason": asset.get("failure_reason") or classify_failure_reason(asset), "quote_success": bool(asset.get("quote_success")), "historical_success": bool(asset.get("historical_success")), "provider": source.get("provider") or "", "provider_symbol": source.get("provider_symbol") or asset.get("ticker")}
 
 
 def critical_group_results(assets: list[dict[str, Any]], critical_groups: dict[str, Any]) -> dict[str, Any]:
@@ -541,41 +578,7 @@ def build_market_quality(assets: list[dict[str, Any]], source: str, fetched_at: 
         warnings.append(f"完整股票池存在缺口: 失败 {failed} 项，但可用率仍达到正式报告阈值。")
     if quote_only_tickers:
         warnings.append(f"部分标的历史指标暂缺，但 quote 可用: {', '.join(quote_only_tickers)}。")
-    return {
-        "source": source,
-        "fetched_at": fetched_at,
-        "total_count": total,
-        "success_count": len(usable),
-        "live_success_count": len(live_success),
-        "cache_success_count": len(cache_success),
-        "failed_count": failed,
-        "success_ratio": success_ratio,
-        "live_success_ratio": live_success_ratio,
-        "cache_success_ratio": len(cache_success) / total if total else 0.0,
-        "min_success_ratio": min_success_ratio,
-        "data_complete": success_ratio >= min_success_ratio,
-        "live_data_complete": live_success_ratio >= min_success_ratio,
-        "formal_report_allowed": formal_report_allowed,
-        "critical_groups": groups,
-        "critical_groups_passed": critical_groups_passed,
-        "provider_counts": provider_counts,
-        "warnings": warnings,
-        "needs_data_source_upgrade": not formal_report_allowed,
-        "upgrade_message": DATA_SOURCE_UPGRADE_MESSAGE if not formal_report_allowed else "",
-        "full_pool_total_count": total,
-        "full_pool_success_count": len(usable),
-        "full_pool_failed_count": failed,
-        "all_total_count": len(assets),
-        "all_success_count": len(usable),
-        "all_failed_count": failed,
-        "success_tickers": success_tickers,
-        "failed_tickers": failed_tickers,
-        "failed_details": failed_details,
-        "quote_success_tickers": quote_success_tickers,
-        "historical_success_tickers": historical_success_tickers,
-        "quote_only_tickers": quote_only_tickers,
-        "extension_failed_details": [],
-    }
+    return {"source": source, "fetched_at": fetched_at, "total_count": total, "success_count": len(usable), "live_success_count": len(live_success), "cache_success_count": len(cache_success), "failed_count": failed, "success_ratio": success_ratio, "live_success_ratio": live_success_ratio, "cache_success_ratio": len(cache_success) / total if total else 0.0, "min_success_ratio": min_success_ratio, "data_complete": success_ratio >= min_success_ratio, "live_data_complete": live_success_ratio >= min_success_ratio, "formal_report_allowed": formal_report_allowed, "critical_groups": groups, "critical_groups_passed": critical_groups_passed, "provider_counts": provider_counts, "warnings": warnings, "needs_data_source_upgrade": not formal_report_allowed, "upgrade_message": DATA_SOURCE_UPGRADE_MESSAGE if not formal_report_allowed else "", "full_pool_total_count": total, "full_pool_success_count": len(usable), "full_pool_failed_count": failed, "all_total_count": len(assets), "all_success_count": len(usable), "all_failed_count": failed, "success_tickers": success_tickers, "failed_tickers": failed_tickers, "failed_details": failed_details, "quote_success_tickers": quote_success_tickers, "historical_success_tickers": historical_success_tickers, "quote_only_tickers": quote_only_tickers, "extension_failed_details": []}
 
 
 def provider_chain_source(provider_chain: list[str]) -> str:
@@ -600,18 +603,19 @@ def save_market_cache_snapshot(market_data: dict[str, Any], snapshot_path: str |
 
 def build_provider_instances(provider_order: list[str], provider_options: dict[str, Any], universe: list[dict[str, Any]], provider_request_timeout_sec: int) -> dict[str, Any]:
     instances: dict[str, Any] = {}
-    tickers = [item["ticker"] for item in universe]
     for provider_name in provider_order:
         normalized = normalize_provider_name(provider_name)
-        if normalized == "cache" or not provider_is_enabled(normalized, provider_options_for(provider_options, normalized)):
+        options = provider_options_for(provider_options, normalized)
+        if normalized == "cache" or not provider_option_enabled(normalized, options) or not provider_is_enabled(normalized, options):
             continue
         try:
-            provider = make_provider(normalized, provider_options_for(provider_options, normalized))
+            provider = make_provider(normalized, options)
         except Exception:
             continue
         instances[normalized] = provider
         prefetch_quotes = getattr(provider, "prefetch_quotes", None)
         if callable(prefetch_quotes):
+            tickers = [item["ticker"] for item in universe]
             try:
                 call_with_timeout(lambda: prefetch_quotes(tickers), provider_request_timeout_sec, f"{provider.name} batch quote")
             except Exception:
@@ -677,6 +681,9 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
     retry_backoff_sec = float(market.get("retry_backoff_sec", 30.0))
     per_ticker_timeout_sec = int(market.get("per_ticker_timeout_sec", 60))
     market_fetch_timeout_sec = int(market.get("market_fetch_timeout_sec", 1200))
+    twelve_data_batch_size = int(market.get("twelve_data_batch_size", 3))
+    twelve_data_batch_sleep_sec = int(market.get("twelve_data_batch_sleep_sec", 90))
+    twelve_data_retry_sleep_sec = int(market.get("twelve_data_retry_sleep_sec", 90))
     cache_dir = market.get("cache_dir", "data/processed/market_cache")
     cache_snapshot_path = market.get("cache_snapshot_path", "data/processed/market_cache.json")
     run_state_path = market.get("run_state_path", "data/processed/market_run_state.json")
@@ -692,6 +699,7 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
 
     assets: list[dict[str, Any]] = []
     timed_out = False
+    twelve_data_throttle_state: dict[str, Any] = {"request_count": 0, "slept_after": 0}
     provider_instances = build_provider_instances(provider_order, provider_options, universe, provider_request_timeout_sec)
     for index, asset in enumerate(universe):
         if seconds_left(market_deadline) <= 0:
@@ -702,7 +710,12 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
         progress_state["current_ticker"] = asset["ticker"]
         progress_state["pending_tickers"] = [item["ticker"] for item in universe[index:]]
         write_run_state(progress_state, run_state_path)
-        frame, error, from_cache, cache_error, actual_provider = fetch_history_with_provider_order(asset["ticker"], period, interval, provider_order, provider_options, cache_dir, retry_count, retry_backoff_sec, cache_max_age_hours, cache_max_trading_days, provider_instances, per_ticker_timeout_sec, provider_request_timeout_sec, market_deadline, progress_state, run_state_path)
+        frame, error, from_cache, cache_error, actual_provider = fetch_history_with_provider_order(
+            asset["ticker"], period, interval, provider_order, provider_options, cache_dir, retry_count, retry_backoff_sec,
+            cache_max_age_hours, cache_max_trading_days, provider_instances, per_ticker_timeout_sec, provider_request_timeout_sec,
+            market_deadline, progress_state, run_state_path, True, twelve_data_throttle_state, twelve_data_batch_size,
+            twelve_data_batch_sleep_sec, twelve_data_retry_sleep_sec,
+        )
         summary = summarize_price_frame(frame)
         frame_attrs = getattr(frame, "attrs", {}) if frame is not None else {}
         quote_success = bool(frame_attrs.get("quote_success"))
@@ -734,37 +747,7 @@ def fetch_market_data(config: dict[str, Any]) -> dict[str, Any]:
         quality["warnings"] = [MARKET_TIMEOUT_MESSAGE] + [warning for warning in quality.get("warnings", []) if warning != MARKET_TIMEOUT_MESSAGE]
         quality["formal_report_allowed"] = False
         quality["needs_data_source_upgrade"] = True
-    market_data = {
-        "metadata": {
-            "source": source,
-            "configured_market_data_provider_order": configured_order,
-            "provider_chain": provider_order,
-            "market_data_provider_order": provider_order,
-            "period": period,
-            "interval": interval,
-            "fetched_at": fetched_at,
-            "timezone": timezone_name,
-            "request_delay_sec": request_delay_sec,
-            "retry_count": retry_count,
-            "retry_backoff_sec": retry_backoff_sec,
-            "provider_request_timeout_sec": provider_request_timeout_sec,
-            "per_ticker_timeout_sec": per_ticker_timeout_sec,
-            "market_fetch_timeout_sec": market_fetch_timeout_sec,
-            "market_fetch_timed_out": timed_out,
-            "timeout_message": MARKET_TIMEOUT_MESSAGE if timed_out else "",
-            "current_provider": progress_state.get("current_provider", ""),
-            "current_ticker": progress_state.get("current_ticker", ""),
-            "unfinished_tickers": unfinished_tickers,
-            "last_error": progress_state.get("last_error", ""),
-            "cache_dir": str(cache_dir),
-            "cache_snapshot_path": str(cache_snapshot_path),
-            "run_state_path": str(run_state_path),
-            "cache_max_age_hours": cache_max_age_hours,
-            "cache_max_trading_days": cache_max_trading_days,
-            **quality,
-        },
-        "assets": assets,
-    }
+    market_data = {"metadata": {"source": source, "configured_market_data_provider_order": configured_order, "provider_chain": provider_order, "market_data_provider_order": provider_order, "period": period, "interval": interval, "fetched_at": fetched_at, "timezone": timezone_name, "request_delay_sec": request_delay_sec, "retry_count": retry_count, "retry_backoff_sec": retry_backoff_sec, "provider_request_timeout_sec": provider_request_timeout_sec, "per_ticker_timeout_sec": per_ticker_timeout_sec, "market_fetch_timeout_sec": market_fetch_timeout_sec, "twelve_data_batch_size": twelve_data_batch_size, "twelve_data_batch_sleep_sec": twelve_data_batch_sleep_sec, "twelve_data_request_count": twelve_data_throttle_state.get("request_count", 0), "market_fetch_timed_out": timed_out, "timeout_message": MARKET_TIMEOUT_MESSAGE if timed_out else "", "current_provider": progress_state.get("current_provider", ""), "current_ticker": progress_state.get("current_ticker", ""), "unfinished_tickers": unfinished_tickers, "last_error": progress_state.get("last_error", ""), "cache_dir": str(cache_dir), "cache_snapshot_path": str(cache_snapshot_path), "run_state_path": str(run_state_path), "cache_max_age_hours": cache_max_age_hours, "cache_max_trading_days": cache_max_trading_days, **quality}, "assets": assets}
     save_market_cache_snapshot(market_data, cache_snapshot_path)
     write_market_provider_diagnostics(market_data)
     progress_state["reason"] = "finished_timeout" if timed_out else "finished"
