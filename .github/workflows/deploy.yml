@@ -149,24 +149,14 @@ jobs:
 
           "$PYTHON_BIN" -m src.health_check --config config.yaml
           set +e
-          "$PYTHON_BIN" -m src.provider_check --provider fmp --symbols AAPL,MSFT,NVDA --config config.yaml
-          fmp_provider_status=$?
-          if grep -q '^TWELVE_DATA_API_KEY=.' .env; then
-            "$PYTHON_BIN" -m src.provider_check --provider twelve_data --symbols AAPL,MSFT,NVDA --config config.yaml
-            twelve_provider_status=$?
-          else
-            echo "::notice::TWELVE_DATA_API_KEY is not configured on the server; Twelve Data provider_check skipped."
-            twelve_provider_status=0
-          fi
+          "$PYTHON_BIN" -m src.provider_check --provider all --universe --config config.yaml
+          provider_status=$?
           set -e
-          if [ "${fmp_provider_status}" -ne 0 ]; then
-            echo "::warning::FMP provider_check failed. Review the diagnostic output above and logs/provider_check.log."
-          fi
-          if [ "${twelve_provider_status}" -ne 0 ]; then
-            echo "::warning::Twelve Data provider_check failed. Review the diagnostic output above and logs/provider_check.log."
+          if [ "${provider_status}" -ne 0 ]; then
+            echo "::warning::Full universe provider_check returned non-zero status. Review the diagnostic output above and logs/provider_check.log."
           fi
           echo "Recent provider check log:"
-          tail -n 120 logs/provider_check.log || true
+          tail -n 160 logs/provider_check.log || true
           echo "Recent server log:"
           tail -n 80 logs/daily.log || true
           REMOTE
@@ -196,7 +186,7 @@ jobs:
           echo "Recent server log:"
           tail -n 120 logs/daily.log || true
 
-          if grep -E "PDF 生成失败|行情数据抓取失败或不足|行情质量警告" logs/daily.log | tail -n 20; then
+          if grep -E "PDF 生成失败|行情数据抓取失败或不足|运行超时|行情质量警告" logs/daily.log | tail -n 20; then
             echo "::warning::Report run finished with warnings. Check logs/daily.log on the server."
           fi
 
