@@ -11,6 +11,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_provider_universe_check:
+        description: "Run the full live provider universe check after deployment"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-us-market-review-main
@@ -148,17 +153,46 @@ jobs:
           fi
 
           "$PYTHON_BIN" -m src.health_check --config config.yaml
-          set +e
-          "$PYTHON_BIN" -m src.provider_check --provider all --universe --config config.yaml
-          provider_status=$?
-          set -e
-          if [ "${provider_status}" -ne 0 ]; then
-            echo "::warning::Full universe provider_check returned non-zero status. Review the diagnostic output above and logs/provider_check.log."
-          fi
+          "$PYTHON_BIN" -m src.provider_check --provider all --symbols AAPL,MSFT,NVDA --config config.yaml
+          "$PYTHON_BIN" -m src.provider_check --provider all --universe --dry-run --config config.yaml
           echo "Recent provider check log:"
           tail -n 160 logs/provider_check.log || true
           echo "Recent server log:"
           tail -n 80 logs/daily.log || true
+          REMOTE
+
+      - name: Full live universe provider check manually
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_provider_universe_check == 'true' }}
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i ~/.ssh/us-market-review-deploy-key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o TCPKeepAlive=yes \
+            "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          cd /opt/us-market-review
+          if [ -x ".venv/bin/python" ]; then
+            PYTHON_BIN=".venv/bin/python"
+          else
+            PYTHON_BIN="python3"
+          fi
+
+          set +e
+          "$PYTHON_BIN" -m src.provider_check --provider all --universe --config config.yaml
+          provider_status=$?
+          set -e
+          tail -n 200 logs/provider_check.log || true
+          if [ "${provider_status}" -ne 0 ]; then
+            echo "::warning::Full live universe provider_check returned non-zero status. Review the diagnostic output above and logs/provider_check.log."
+          fi
+          exit "${provider_status}"
           REMOTE
 
       - name: Run report manually over SSH
