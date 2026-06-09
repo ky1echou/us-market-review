@@ -4,7 +4,7 @@ import argparse
 import shutil
 from pathlib import Path
 
-from .fetch_market import load_config, parse_provider_chain
+from .fetch_market import load_config, parse_provider_order
 from .market_data_provider import provider_display_name
 
 
@@ -15,7 +15,7 @@ def main() -> None:
 
     config = load_config(args.config)
     market = config.get("market", {})
-    provider_chain = parse_provider_chain(market.get("provider_chain", market.get("provider")))
+    provider_chain = parse_provider_order(market.get("provider_chain", market.get("provider")))
     provider_names = []
     for provider in provider_chain:
         provider_names.append(provider_display_name(provider))
