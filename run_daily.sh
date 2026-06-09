@@ -32,20 +32,20 @@ timestamp() {
 echo "[$(timestamp)] run_daily.sh start project=$PROJECT_DIR config=$CONFIG_PATH timeout=$RUN_DAILY_TIMEOUT" >> "$LOG_FILE"
 
 if [ -n "${PYTHON:-}" ]; then
-  PY_CMD=("$PYTHON")
+  PYTHON_BIN="$PYTHON"
 elif [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
-  PY_CMD=("$PROJECT_DIR/.venv/bin/python")
+  PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then
-  PY_CMD=(python3)
+  PYTHON_BIN="$(command -v python3)"
 elif command -v python >/dev/null 2>&1; then
-  PY_CMD=(python)
+  PYTHON_BIN="$(command -v python)"
 else
   echo "[$(timestamp)] failure reason=Python not found. Create .venv or install python3." >> "$LOG_FILE"
   exit 1
 fi
 
 notify_skip() {
-  "${PY_CMD[@]}" - <<'PY' >> "$LOG_FILE" 2>&1 || true
+  "$PYTHON_BIN" - <<'PY' >> "$LOG_FILE" 2>&1 || true
 from src.send_report import send_telegram_message, telegram_enabled
 message = "us-market-review 正在运行，已跳过本次触发。"
 if telegram_enabled():
@@ -57,7 +57,7 @@ PY
 }
 
 notify_timeout() {
-  "${PY_CMD[@]}" -m src.timeout_alert --config "$CONFIG_PATH" --timeout "$RUN_DAILY_TIMEOUT" >> "$LOG_FILE" 2>&1 || true
+  "$PYTHON_BIN" -m src.timeout_alert --config "$CONFIG_PATH" --timeout "$RUN_DAILY_TIMEOUT" >> "$LOG_FILE" 2>&1 || true
 }
 
 if [ ! -f "$CONFIG_PATH" ]; then
@@ -97,14 +97,36 @@ cleanup() {
 }
 trap cleanup EXIT
 
+export PYTHON_BIN CONFIG_PATH
+
 set +e
 if command -v timeout >/dev/null 2>&1; then
-  timeout "$RUN_DAILY_TIMEOUT" "${PY_CMD[@]}" -m src.render_report --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+  timeout "$RUN_DAILY_TIMEOUT" bash -c '
+    set -Eeuo pipefail
+    echo "[$(date +"%Y-%m-%dT%H:%M:%S%z")] step=refresh_market_data start"
+    "$PYTHON_BIN" -m src.refresh_market_data --config "$CONFIG_PATH"
+    echo "[$(date +"%Y-%m-%dT%H:%M:%S%z")] step=data_quality_check start"
+    "$PYTHON_BIN" -m src.data_quality_check --config "$CONFIG_PATH"
+    echo "[$(date +"%Y-%m-%dT%H:%M:%S%z")] step=render_report start"
+    "$PYTHON_BIN" -m src.render_report --config "$CONFIG_PATH"
+  ' 2>&1 | tee -a "$LOG_FILE"
   status=${PIPESTATUS[0]}
 else
   echo "[$(timestamp)] warning reason=timeout command not found; running without external timeout" >> "$LOG_FILE"
-  "${PY_CMD[@]}" -m src.render_report --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
-  status=${PIPESTATUS[0]}
+  "$PYTHON_BIN" -m src.refresh_market_data --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+  status_refresh=${PIPESTATUS[0]}
+  if [ "$status_refresh" -eq 0 ]; then
+    "$PYTHON_BIN" -m src.data_quality_check --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+    status_quality=${PIPESTATUS[0]}
+  else
+    status_quality="$status_refresh"
+  fi
+  if [ "$status_quality" -eq 0 ]; then
+    "$PYTHON_BIN" -m src.render_report --config "$CONFIG_PATH" 2>&1 | tee -a "$LOG_FILE"
+    status=${PIPESTATUS[0]}
+  else
+    status="$status_quality"
+  fi
 fi
 set -e
 
