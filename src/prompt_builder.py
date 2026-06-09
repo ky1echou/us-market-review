@@ -8,12 +8,25 @@ from .indicators import breadth, rank_by_metric, safe_float
 
 
 INDEX_ORDER = ["SPY", "QQQ", "DIA", "IWM", "SMH", "SOXX", "VIX"]
-FOCUS_ETFS = ["SPY", "QQQ", "DIA", "IWM", "SMH", "SOXX", "XLK", "XLF", "XLE", "XLV", "TLT", "GLD", "USO"]
+MEGA_TECH = ["MSFT", "AMZN", "NVDA", "AAPL", "GOOGL", "META", "TSLA"]
+WATCH_MOVERS = ["SNOW", "NOW", "MDB", "AMD", "MU", "AVGO", "MRVL", "ARM", "PLTR", "ORCL", "CRWD", "DDOG"]
+AI_REPS = ["SNOW", "NOW", "AMD", "AVGO", "MU", "MRVL", "ARM"]
+ETF_LOOK = ["QQQ", "SPY", "SMH", "SOXX", "XLK", "XLF", "XLE", "XLV"]
 MACRO_ASSETS = ["US10Y", "DXY", "TLT", "GLD", "USO", "CPER", "BTCUSD"]
-MEGA_TECH = ["NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA"]
-AI_HARDWARE = ["AMD", "AVGO", "MU", "MRVL", "ARM"]
-AI_APPS = ["SNOW", "NOW"]
-AI_CHAIN = MEGA_TECH + AI_HARDWARE + AI_APPS
+
+
+INDEX_NAMES = {
+    "SPY": "标普500",
+    "QQQ": "纳斯达克",
+    "DIA": "道琼斯",
+    "IWM": "罗素2000",
+    "SMH": "费城半导体",
+    "SOXX": "费城半导体",
+    "VIX": "VIX",
+}
+
+
+BANNED_FOOTNOTE_WORDS = ["HTTP", "provider_chain", "Too Many Requests", "缓存降级ticker"]
 
 
 def md_escape(value: Any) -> str:
@@ -23,7 +36,7 @@ def md_escape(value: Any) -> str:
 
 def markdown_table(headers: list[str], rows: list[list[Any]]) -> str:
     if not rows:
-        return "本节标的数据不足；系统不会用空表替代正式判断。"
+        rows = [["无重大增量", "当日公开信息", "不强行归因，等待下一交易日验证"]]
     lines = [
         "| " + " | ".join(md_escape(header) for header in headers) + " |",
         "| " + " | ".join(["---"] * len(headers)) + " |",
@@ -49,21 +62,12 @@ def fmt_percent(value: Any, digits: int = 2) -> str:
     return f"{number * 100:+.{digits}f}%"
 
 
-def fmt_rsi(value: Any) -> str:
-    number = safe_float(value)
-    return "暂缺" if number is None else f"{number:.1f}"
-
-
 def valid_asset(asset: dict[str, Any] | None) -> bool:
-    return bool(asset and safe_float(asset.get("last_close")) is not None and (safe_float(asset.get("daily_change")) is not None or asset.get("quote_success")))
-
-
-def valid_assets(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [asset for asset in assets if valid_asset(asset)]
+    return bool(asset and safe_float(asset.get("last_close")) is not None)
 
 
 def by_ticker(assets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {str(asset.get("ticker")): asset for asset in assets}
+    return {str(asset.get("ticker", "")).upper(): asset for asset in assets}
 
 
 def pick_assets(assets: list[dict[str, Any]], tickers: list[str]) -> list[dict[str, Any]]:
@@ -71,389 +75,396 @@ def pick_assets(assets: list[dict[str, Any]], tickers: list[str]) -> list[dict[s
     return [lookup[ticker] for ticker in tickers if valid_asset(lookup.get(ticker))]
 
 
+def asset_name(asset: dict[str, Any]) -> str:
+    return str(asset.get("name") or asset.get("ticker") or "")
+
+
 def asset_title(asset: dict[str, Any]) -> str:
-    return f"{asset.get('name', asset.get('ticker'))}({asset.get('ticker')})"
+    return f"{asset_name(asset)}({asset.get('ticker')})"
 
 
-def ticker_list(values: list[Any], limit: int = 80) -> str:
-    clean = [str(value) for value in values if str(value)]
-    if not clean:
-        return "无"
-    if len(clean) <= limit:
-        return "、".join(clean)
-    return "、".join(clean[:limit]) + f" 等{len(clean)}项"
-
-
-def status_label(asset: dict[str, Any]) -> str:
-    change = safe_float(asset.get("daily_change"))
-    ma20 = safe_float(asset.get("ma20_deviation"))
-    rsi = safe_float(asset.get("rsi14"))
-    if change is None:
-        return "价格可用/指标暂缺"
-    if rsi is not None and rsi >= 70:
-        return "高位强势"
-    if rsi is not None and rsi <= 30:
-        return "低位承压"
-    if change > 0 and (ma20 or 0) > 0:
-        return "强势延续"
-    if change > 0:
-        return "修复"
-    if change < 0 and (ma20 or 0) < 0:
-        return "弱势延续"
-    if change < 0:
-        return "回撤"
-    return "震荡"
-
-
-def source_label(asset: dict[str, Any]) -> str:
-    source = asset.get("source", {}) if isinstance(asset.get("source"), dict) else {}
-    provider = source.get("provider") or "未披露"
-    as_of = asset.get("as_of") or source.get("as_of") or "日期暂缺"
-    if asset.get("from_cache") or source.get("from_cache"):
-        return f"缓存/{as_of}"
-    return f"{provider}/{as_of}"
-
-
-def source_note(market_data: dict[str, Any]) -> str:
-    metadata = market_data.get("metadata", {})
-    counts = metadata.get("provider_counts", {}) or {}
-    count_text = "、".join(f"{provider} {count}项" for provider, count in counts.items()) or "未披露"
-    success_ratio = float(metadata.get("success_ratio") or 0.0) * 100
-    total = int(metadata.get("total_count") or 0)
-    live = int(metadata.get("live_success_count") or 0)
-    cache = int(metadata.get("cache_success_count") or 0)
-    live_ratio = live / total * 100 if total else 0.0
-    cache_ratio = cache / total * 100 if total else 0.0
-    assets = market_data.get("assets", [])
-    cache_detail = [f"{asset.get('ticker')}({asset.get('as_of') or asset.get('source', {}).get('as_of') or '日期暂缺'})" for asset in assets if asset.get("from_cache")]
-    failed_tickers = metadata.get("failed_tickers", []) or [item.get("ticker") for item in metadata.get("failed_details", [])]
-    return (
-        f"数据口径：行情源 {metadata.get('source') or '未披露'}；获取时间 {metadata.get('fetched_at') or '未披露'}；"
-        f"完整池行情可用 {metadata.get('success_count', 0)}/{total}，可用率 {success_ratio:.1f}%；"
-        f"实时获取 {live}（{live_ratio:.1f}%），缓存降级 {cache}（{cache_ratio:.1f}%），失败 {metadata.get('failed_count', 0)}；"
-        f"来源分布：{count_text}。\n\n"
-        f"缓存降级 ticker：{ticker_list(cache_detail)}。\n\n"
-        f"失败 ticker：{ticker_list([ticker for ticker in failed_tickers if ticker])}。"
-    )
-
-
-def price_table(assets: list[dict[str, Any]]) -> str:
-    rows = []
-    for asset in valid_assets(assets):
-        rows.append([
-            asset_title(asset),
-            fmt_number(asset.get("last_close")),
-            fmt_percent(asset.get("daily_change")),
-            fmt_percent(asset.get("ma5_deviation")),
-            fmt_percent(asset.get("ma20_deviation")),
-            fmt_rsi(asset.get("rsi14")),
-            status_label(asset),
-            source_label(asset),
-        ])
-    return markdown_table(["标的", "收盘", "涨跌幅", "MA5", "MA20", "RSI", "状态", "数据源/日期"], rows)
-
-
-def news_source_text(item: dict[str, Any]) -> str:
-    parts = [item.get("source") or "未披露"]
-    if item.get("classification"):
-        parts.append("级别: " + "/".join(item.get("classification", [])))
-    if item.get("published_at"):
-        parts.append(f"发布: {item['published_at']}")
-    parts.append(f"获取: {item.get('fetched_at') or '未披露'}")
-    return "；".join(parts)
-
-
-def news_bullets(items: list[dict[str, Any]], limit: int = 5) -> str:
-    if not items:
-        return "- 公开新闻窗口内未发现高置信增量催化，暂不强行归因。"
-    lines: list[str] = []
-    for item in items[:limit]:
-        title = item.get("title") or "未披露标题"
-        link = item.get("link") or ""
-        title_text = f"[{title}]({link})" if link else title
-        lines.append(f"- {title_text}。来源：{news_source_text(item)}")
-    return "\n".join(lines)
-
-
-def filter_news_by_tag(news_items: list[dict[str, Any]], tag: str) -> list[dict[str, Any]]:
-    return [item for item in news_items if tag in set(item.get("tags", []))]
-
-
-def company_news_for_ticker(news_items: list[dict[str, Any]], ticker: str) -> list[dict[str, Any]]:
-    return [item for item in news_items if ticker in set(item.get("company_tickers", [])) and "公司级" in set(item.get("classification", []))]
-
-
-def match_news_for_asset(asset: dict[str, Any], news_items: list[dict[str, Any]]) -> str:
-    matches = company_news_for_ticker(news_items, str(asset.get("ticker", "")))
-    if not matches:
-        return "未匹配到明确公司级催化，按盘面强弱跟踪"
-    item = matches[0]
-    title = item.get("title") or "未披露标题"
-    link = item.get("link") or ""
-    title_text = f"[{title}]({link})" if link else title
-    return f"{title_text}；来源：{news_source_text(item)}"
-
-
-def change_of(lookup: dict[str, dict[str, Any]], ticker: str) -> float | None:
-    asset = lookup.get(ticker)
+def change(asset: dict[str, Any] | None) -> float | None:
     return safe_float(asset.get("daily_change")) if asset else None
 
 
-def market_regime(assets: list[dict[str, Any]], stocks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    lookup = by_ticker(assets + (stocks or []))
-    spy = change_of(lookup, "SPY")
-    qqq = change_of(lookup, "QQQ")
-    iwm = change_of(lookup, "IWM")
-    smh = change_of(lookup, "SMH")
-    soxx = change_of(lookup, "SOXX")
-    vix = change_of(lookup, "VIX")
+def avg_change(assets: list[dict[str, Any]]) -> float | None:
+    values = [change(asset) for asset in assets]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def signal_for(asset: dict[str, Any]) -> str:
+    daily = change(asset)
+    ma20 = safe_float(asset.get("ma20_deviation"))
+    if daily is None:
+        return "价格可用，涨跌幅暂缺"
+    if daily <= -0.03:
+        return "明显承压，盘前先看修复承接"
+    if daily >= 0.03:
+        return "明显走强，强者恒强但不宜盲目追高"
+    if daily > 0 and (ma20 or 0) > 0:
+        return "温和偏强，趋势仍在"
+    if daily < 0 and (ma20 or 0) < 0:
+        return "弱势延续，等待止跌"
+    if daily > 0:
+        return "边际修复"
+    if daily < 0:
+        return "小幅回撤"
+    return "震荡"
+
+
+def market_regime(all_assets: list[dict[str, Any]]) -> dict[str, Any]:
+    lookup = by_ticker(all_assets)
+    spy = change(lookup.get("SPY"))
+    qqq = change(lookup.get("QQQ"))
+    iwm = change(lookup.get("IWM"))
+    smh = change(lookup.get("SMH")) if change(lookup.get("SMH")) is not None else change(lookup.get("SOXX"))
+    vix = change(lookup.get("VIX"))
     broad_values = [value for value in [spy, qqq, iwm] if value is not None]
     broad_avg = sum(broad_values) / len(broad_values) if broad_values else None
     risk_off = (spy is not None and spy <= -0.01) or (qqq is not None and qqq <= -0.01) or (vix is not None and vix >= 0.10)
-    return {"spy": spy, "qqq": qqq, "iwm": iwm, "smh": smh, "soxx": soxx, "vix": vix, "broad_avg": broad_avg, "risk_off": risk_off}
+    return {"spy": spy, "qqq": qqq, "iwm": iwm, "smh": smh, "vix": vix, "broad_avg": broad_avg, "risk_off": risk_off}
 
 
-def market_tone(index_assets: list[dict[str, Any]], stocks: list[dict[str, Any]] | None = None) -> str:
-    valid = [asset for asset in valid_assets(index_assets) if asset.get("ticker") != "VIX"]
-    if not valid:
-        return "判断：主要宽基 ETF 可用数据不足，系统不应生成正式复盘。"
-    counts = breadth(valid)
-    regime = market_regime(index_assets, stocks)
+def headline_judgement(index_assets: list[dict[str, Any]], stocks: list[dict[str, Any]]) -> str:
+    regime = market_regime(index_assets + stocks)
+    mega = avg_change(pick_assets(stocks, MEGA_TECH))
+    semis = avg_change(pick_assets(stocks, ["AMD", "AVGO", "MU", "MRVL", "ARM"]))
     if regime["risk_off"]:
-        return (
-            f"判断：昨夜不是全面风险偏好回暖，而是宽基承压、波动率抬升下的结构分化。"
-            f"宽基平均涨跌幅 {fmt_percent(regime['broad_avg'])}，上涨 {counts['up']} 个、下跌 {counts['down']} 个；"
-            f"VIX {fmt_percent(regime['vix'])}，半导体或存储链若逆势走强，也只能理解为局部主线占优。"
-        )
-    if regime["broad_avg"] is not None and regime["broad_avg"] > 0.003 and counts["up"] >= counts["down"]:
-        return f"判断：风险偏好温和修复，但仍需看科技、半导体和小盘能否同步扩散。宽基平均涨跌幅 {fmt_percent(regime['broad_avg'])}。"
-    return f"判断：盘面以震荡分化为主，尚未形成全面扩散。宽基平均涨跌幅 {fmt_percent(regime['broad_avg'])}，上涨 {counts['up']} 个、下跌 {counts['down']} 个。"
+        return "昨夜美股并非全面风险偏好回暖，而是宽基承压、波动率抬升下的结构分化；大型科技权重对指数形成拖累，半导体内部若有强势也只能视为局部主线占优。"
+    if mega is not None and semis is not None and semis > mega:
+        return "昨夜美股风险偏好边际修复，但主线并非平均扩散，半导体/AI硬件相对大型科技平台更有弹性。"
+    if regime["broad_avg"] is not None and regime["broad_avg"] > 0:
+        return "昨夜美股整体偏修复，宽基与科技共同回暖，但AH盘前仍需确认成交扩散而非单点脉冲。"
+    return "昨夜美股整体震荡分化，指数方向不强，盘前更应重视强弱结构而非简单看涨看跌。"
 
 
-def one_sentence(etfs: list[dict[str, Any]], stocks: list[dict[str, Any]]) -> str:
-    regime = market_regime(etfs, stocks)
+def one_sentence(index_assets: list[dict[str, Any]], stocks: list[dict[str, Any]]) -> str:
+    regime = market_regime(index_assets + stocks)
     if regime["risk_off"]:
-        return "一句话总判断：昨夜美股并非全面风险偏好回暖，而是大型科技权重、宽基和波动率共同约束下的结构分化；AH盘前不宜全面追高，优先看强映射方向和开盘承接。"
-    ranked_stocks = rank_by_metric(valid_assets(stocks), "daily_change", reverse=True)
-    lead_stock = asset_title(ranked_stocks[0]) if ranked_stocks else "强势科技股"
-    return f"一句话总判断：昨夜美股风险偏好边际修复，但主线仍要看 {lead_stock} 代表的AI链能否从个股扩散到ETF和AH映射。"
+        return "一句话结论：大型科技与宽基压力仍在，AI链只做结构映射，AH盘前承接为主、不追高。"
+    return "一句话结论：风险偏好边际修复但仍需扩散确认，优先跟踪AI链强映射和ETF相对强弱。"
 
 
-def three_questions(assets: list[dict[str, Any]]) -> str:
-    regime = market_regime(assets)
-    risk = "全面回暖" if not regime["risk_off"] and (regime["spy"] or 0) > 0 and (regime["qqq"] or 0) > 0 else "局部修复/结构分化"
-    size = "小盘相对占优" if regime["iwm"] is not None and regime["spy"] is not None and regime["iwm"] > regime["spy"] else "大盘相对占优或小盘承接不足"
-    semi = regime["smh"] if regime["smh"] is not None else regime["soxx"]
-    tech = "科技/半导体相对占优" if semi is not None and regime["spy"] is not None and semi > regime["spy"] else "科技/半导体主导性需要确认"
-    return markdown_table(
-        ["问题", "回答", "观察口径"],
-        [
-            ["风险偏好是全面回暖还是局部修复？", risk, "SPY、QQQ、IWM 与 VIX 同时验证"],
-            ["大盘/小盘谁更强？", size, "IWM 相对 SPY"],
-            ["科技/半导体是否仍是主导？", tech, "SMH/SOXX 相对 SPY，叠加NVDA/AMD/MU/MRVL"],
-        ],
-    )
-
-
-def sector_summary(etfs: list[dict[str, Any]]) -> str:
-    ranked = rank_by_metric(valid_assets(etfs), "daily_change", reverse=True)
-    if not ranked:
-        return "判断：ETF 数据不足，暂不做行业强弱排序。"
-    strongest = ranked[0]
-    weakest = ranked[-1]
-    return (
-        f"判断：行业结构看{asset_title(strongest)}相对最强，{asset_title(weakest)}相对最弱；"
-        f"前者涨跌幅 {fmt_percent(strongest.get('daily_change'))}，后者 {fmt_percent(weakest.get('daily_change'))}。"
-        "交易含义：若强势集中在半导体/AI硬件，AH以强映射链条为主；若防御或能源领先，则降低成长股追高冲动。"
-    )
-
-
-def flow_direction(assets: list[dict[str, Any]]) -> str:
-    lookup = by_ticker(assets)
-    pairs = {
-        "成长/价值": (lookup.get("QQQ"), lookup.get("XLF")),
-        "大盘/小盘": (lookup.get("SPY"), lookup.get("IWM")),
-        "科技/能源": (lookup.get("XLK"), lookup.get("XLE")),
-        "半导体/宽基": (lookup.get("SMH") or lookup.get("SOXX"), lookup.get("SPY")),
-        "防御/风险": (lookup.get("XLV"), lookup.get("QQQ")),
-    }
-    judgements = []
-    for label, pair in pairs.items():
-        left, right = pair
-        if not left or not right:
+def index_table(index_assets: list[dict[str, Any]]) -> str:
+    lookup = by_ticker(index_assets)
+    rows: list[list[Any]] = []
+    for ticker in ["SPY", "QQQ", "DIA", "IWM", "SMH", "VIX"]:
+        asset = lookup.get(ticker) or (lookup.get("SOXX") if ticker == "SMH" else None)
+        if not valid_asset(asset):
             continue
-        left_change = safe_float(left.get("daily_change"))
-        right_change = safe_float(right.get("daily_change"))
-        if left_change is None or right_change is None:
-            continue
-        stronger = asset_title(left) if left_change >= right_change else asset_title(right)
-        judgements.append(f"{label}看{stronger}更强")
-    return "资金切换方向：" + "；".join(judgements) + "。" if judgements else "资金切换方向：等待开盘后验证扩散。"
+        rows.append([INDEX_NAMES.get(ticker, ticker), fmt_number(asset.get("last_close")), fmt_percent(asset.get("daily_change"))])
+    return markdown_table(["指数", "收盘", "涨跌幅"], rows)
 
 
-def macro_block(title: str, items: list[dict[str, Any]], us_impact: str, ah_impact: str) -> str:
-    return "\n".join([f"### {title}", news_bullets(items, limit=3), f"- 对美股影响：{us_impact}", f"- 对AH影响：{ah_impact}", ""])
+def ma20_sentence(index_assets: list[dict[str, Any]]) -> str:
+    lookup = by_ticker(index_assets)
+    pieces = []
+    for ticker in ["SPY", "QQQ", "IWM", "SMH", "VIX"]:
+        asset = lookup.get(ticker) or (lookup.get("SOXX") if ticker == "SMH" else None)
+        if valid_asset(asset):
+            pieces.append(f"{INDEX_NAMES.get(ticker, ticker)} {fmt_percent(asset.get('ma20_deviation'))}")
+    return "MA20偏离：" + "；".join(pieces) + "。" if pieces else "MA20偏离：关键指数历史数据暂缺，等待补齐后再做趋势判断。"
 
 
-def grouped_stock_table(title: str, stocks: list[dict[str, Any]], tickers: list[str], news_items: list[dict[str, Any]]) -> str:
+def three_questions(index_assets: list[dict[str, Any]]) -> str:
+    regime = market_regime(index_assets)
+    risk = "局部修复/结构分化" if regime["risk_off"] or not ((regime["spy"] or 0) > 0 and (regime["qqq"] or 0) > 0) else "偏全面回暖，但仍需小盘确认"
+    size = "小盘强于大盘" if regime["iwm"] is not None and regime["spy"] is not None and regime["iwm"] > regime["spy"] else "大盘强于小盘，小盘承接不足"
+    semi = "仍是主导或相对抗跌" if regime["smh"] is not None and regime["spy"] is not None and regime["smh"] > regime["spy"] else "主导性需要重新确认"
+    return "\n".join([
+        f"1. 风险偏好是全面回暖还是局部修复？{risk}。",
+        f"2. 大盘 / 小盘谁更强？{size}。",
+        f"3. 科技 / 半导体是否仍是主导？{semi}。",
+    ])
+
+
+def news_source(item: dict[str, Any]) -> str:
+    source = item.get("source") or "公开信息"
+    date = str(item.get("published_at") or item.get("fetched_at") or "当日")[:10]
+    return f"{source} / {date}"
+
+
+def filter_news(news_items: list[dict[str, Any]], tag: str) -> list[dict[str, Any]]:
+    return [item for item in news_items if tag in set(item.get("tags", []))]
+
+
+def company_news(news_items: list[dict[str, Any]], ticker: str) -> list[dict[str, Any]]:
+    return [item for item in news_items if ticker in set(item.get("company_tickers", [])) and "公司级" in set(item.get("classification", []))]
+
+
+def catalyst_text(news_items: list[dict[str, Any]], ticker: str) -> str:
+    items = company_news(news_items, ticker)
+    if not items:
+        return "未匹配到明确公司级催化，按盘面强弱跟踪"
+    return str(items[0].get("title") or "公司级催化")[:72]
+
+
+def macro_event_table(items: list[dict[str, Any]]) -> str:
     rows = []
+    for item in items[:3]:
+        rows.append([item.get("title") or "宏观事件", news_source(item), (item.get("summary") or "影响利率与风险偏好预期")[:90]])
+    if not rows:
+        rows.append(["无重大增量", "公开新闻窗口", "隔夜未见足以改写降息交易的新增宏观事件"])
+    return markdown_table(["事件", "来源日期", "要点"], rows)
+
+
+def geopolitics_table(items: list[dict[str, Any]]) -> str:
+    rows = []
+    for item in items[:3]:
+        title = str(item.get("title") or "地缘事件")
+        rows.append([title[:34], news_source(item), "关注油气、黄金、航运与出口管制风险溢价"])
+    if not rows:
+        rows.append(["主要地缘冲突", "近2日无重大增量", "对油气/黄金/航运影响暂不放大"])
+    return markdown_table(["冲突", "近2日状态", "变化"], rows)
+
+
+def sector_bullets(etfs: list[dict[str, Any]], stocks: list[dict[str, Any]]) -> str:
+    lookup = by_ticker(etfs + stocks)
+    ai_apps = pick_assets(stocks, ["SNOW", "NOW"])
+    mega = pick_assets(stocks, MEGA_TECH)
+    semis = pick_assets(stocks, ["AMD", "AVGO", "MU", "MRVL", "ARM"])
+    traditional = pick_assets(etfs, ["XLE", "XLF", "XLV"])
+    strongest = rank_by_metric([asset for asset in etfs + stocks if valid_asset(asset)], "daily_change", reverse=True)
+    judgement = f"判断：资金最强线索落在{asset_title(strongest[0])}，但是否能扩散到AH仍要看开盘承接。" if strongest else "判断：行业强弱数据不足，盘前先看成交验证。"
+    return "\n".join([
+        f"- AI软件应用：{fmt_percent(avg_change(ai_apps))}，重点看 Snowflake / ServiceNow 是否从情绪转为订单逻辑。",
+        f"- 大型科技：{fmt_percent(avg_change(mega))}，决定纳指和港股互联网情绪。",
+        f"- SaaS/IT服务：{fmt_percent(avg_change(ai_apps))}，若强于大盘，AH优先看AI应用层。",
+        f"- 传统工业/能源：{fmt_percent(avg_change(traditional))}，用于判断资金是否从成长切向防御/资源。",
+        judgement,
+    ])
+
+
+def etf_structure_table(etfs: list[dict[str, Any]]) -> str:
+    lookup = by_ticker(etfs)
+    rows = []
+    for ticker, dim in [("QQQ", "成长/纳指权重"), ("SPY", "大盘宽基"), ("SMH", "半导体主线")]:
+        asset = lookup.get(ticker) or (lookup.get("SOXX") if ticker == "SMH" else None)
+        if valid_asset(asset):
+            rows.append([ticker, dim, f"{fmt_percent(asset.get('daily_change'))}，{signal_for(asset)}"])
+    spy = lookup.get("SPY")
+    qqq = lookup.get("QQQ")
+    if valid_asset(spy) and valid_asset(qqq):
+        rows.append(["SPY/QQQ量变", "成长相对宽基", "QQQ相对SPY " + fmt_percent((change(qqq) or 0) - (change(spy) or 0))])
+    return markdown_table(["ETF", "关注维度", "信号"], rows)
+
+
+def megatech_table(stocks: list[dict[str, Any]], news_items: list[dict[str, Any]]) -> str:
     lookup = by_ticker(stocks)
-    for ticker in tickers:
+    rows = []
+    for ticker in MEGA_TECH:
+        asset = lookup.get(ticker)
+        if valid_asset(asset):
+            rows.append([ticker, fmt_percent(asset.get("daily_change")), signal_for(asset)])
+    return markdown_table(["股票", "涨跌幅", "信号"], rows)
+
+
+def movers_bullets(stocks: list[dict[str, Any]], news_items: list[dict[str, Any]]) -> str:
+    lookup = by_ticker(stocks)
+    candidates = []
+    for ticker in WATCH_MOVERS:
         asset = lookup.get(ticker)
         if not valid_asset(asset):
             continue
-        rows.append([asset_title(asset), asset.get("theme") or "未归类", fmt_percent(asset.get("daily_change")), fmt_percent(asset.get("ma20_deviation")), fmt_rsi(asset.get("rsi14")), status_label(asset), source_label(asset), match_news_for_asset(asset, news_items)])
-    return f"### {title}\n" + markdown_table(["股票", "主线", "涨跌幅", "MA20", "RSI", "状态", "数据源/日期", "公司级催化"], rows)
+        daily = abs(change(asset) or 0)
+        has_news = bool(company_news(news_items, ticker))
+        if daily >= 0.025 or has_news:
+            candidates.append(asset)
+    candidates = rank_by_metric(candidates, "daily_change", reverse=True)[:6]
+    if not candidates:
+        return "- 自选池未出现足以单独列示的公司级催化或显著异动，盘前以 ETF 与核心权重承接为主。"
+    lines = []
+    for asset in candidates:
+        ticker = str(asset.get("ticker"))
+        lines.append(f"- {asset_title(asset)}：{fmt_percent(asset.get('daily_change'))}，{signal_for(asset)}；{catalyst_text(news_items, ticker)}。")
+    return "\n".join(lines)
 
 
-def ai_layered_summary(stocks: list[dict[str, Any]], etfs: list[dict[str, Any]], ai_news: list[dict[str, Any]]) -> str:
+def ai_three_questions(stocks: list[dict[str, Any]], etfs: list[dict[str, Any]]) -> str:
     lookup = by_ticker(stocks + etfs)
-    layers = [
-        ("算力/AI芯片", ["NVDA", "AMD", "AVGO", "ARM"]),
-        ("半导体/HBM/网络", ["SMH", "SOXX", "MU", "MRVL"]),
-        ("云厂商AI Capex", ["MSFT", "AMZN", "GOOGL", "META"]),
-        ("SaaS / AI应用", ["SNOW", "NOW"]),
-        ("端侧/机器人/自动驾驶", ["AAPL", "TSLA"]),
-    ]
+    capex = avg_change([asset for ticker in ["MSFT", "AMZN", "GOOGL", "META"] if valid_asset((asset := lookup.get(ticker)))])
+    semis = avg_change([asset for ticker in ["NVDA", "AMD", "AVGO", "MU", "MRVL", "ARM", "SMH", "SOXX"] if valid_asset((asset := lookup.get(ticker)))])
+    apps = avg_change([asset for ticker in ["SNOW", "NOW"] if valid_asset((asset := lookup.get(ticker)))])
+    return "\n".join([
+        f"1. AI主线是在扩散、收敛，还是高位分歧？当前更像结构分化，强弱取决于半导体 {fmt_percent(semis)} 与应用 {fmt_percent(apps)} 的相对表现。",
+        f"2. AI Capex、半导体、软件、端侧应用分别强弱如何？云厂商/Capex {fmt_percent(capex)}，半导体 {fmt_percent(semis)}，软件应用 {fmt_percent(apps)}，端侧看 AAPL/TSLA 承接。",
+        "3. 业绩与指引是强化还是削弱 AI 主线？若公司级新闻不足，则不强行用新闻解释行情，只按价格与ETF相对强弱判断。",
+    ])
+
+
+def ai_catalyst_table(ai_news: list[dict[str, Any]]) -> str:
     rows = []
-    for layer, tickers in layers:
-        assets = [lookup[ticker] for ticker in tickers if valid_asset(lookup.get(ticker))]
-        counts = breadth(assets)
-        leader = rank_by_metric(assets, "daily_change", reverse=True)
-        judgement = "强化" if counts["up"] > counts["down"] else "分化" if counts["up"] else "削弱"
-        rows.append([layer, f"上涨 {counts['up']} / 下跌 {counts['down']}", asset_title(leader[0]) if leader else "暂缺", judgement])
-    return markdown_table(["AI分层", "盘面广度", "代表强势", "主线判断"], rows) + f"\n\n产业级 AI 催化新闻 {len(ai_news)} 条，新闻只作为催化，不替代行情判断。"
+    for item in ai_news[:5]:
+        title = str(item.get("title") or "AI产业催化")
+        rows.append([title[:44], news_source(item), "算力/云Capex/半导体/数据中心/AI应用", "作为产业催化观察，不替代行情判断", "若对应AH强映射开盘承接，再考虑update"])
+    if not rows:
+        rows.append(["无高相关新增AI产业催化", "公开新闻窗口", "无", "不改变主线判断", "不update"])
+    return markdown_table(["事件", "来源日期", "影响链条", "对美股复盘结论", "对A股盘前结论是否update"], rows)
 
 
-def ah_action(strength: str, asset: dict[str, Any]) -> str:
-    change = safe_float(asset.get("daily_change"))
-    if "强" in strength and change is not None and change > 0:
-        return "可关注，等开盘承接确认"
-    if "强" in strength:
-        return "仅观察强映射是否抗跌"
-    if "弱" in strength:
-        return "仅情绪验证，不追高"
-    return "等待确认，避免直接追高"
-
-
-def ah_rows(config: dict[str, Any], stocks: list[dict[str, Any]], etfs: list[dict[str, Any]]) -> tuple[list[list[Any]], list[list[Any]]]:
+def ah_mapping_rows(config: dict[str, Any], stocks: list[dict[str, Any]], etfs: list[dict[str, Any]]) -> list[list[Any]]:
     lookup = by_ticker(stocks + etfs)
-    strong_rows: list[list[Any]] = []
-    other_rows: list[list[Any]] = []
-    for item in config.get("ah_mapping", []):
-        ticker = item.get("us_ticker")
-        asset = lookup.get(ticker, {})
+    rows = []
+    for item in config.get("ah_mapping", [])[:8]:
+        ticker = str(item.get("us_ticker", "")).upper()
+        asset = lookup.get(ticker)
         if not valid_asset(asset):
             continue
-        strength = item.get("mapping_strength", "情绪映射")
-        base = [
-            f"{item.get('us_name', ticker)}({ticker})",
-            item.get("theme", "未归类"),
-            fmt_percent(asset.get("daily_change")),
-            item.get("a_h_mapping", "未配置"),
-            ah_action(strength, asset),
-        ]
-        if "强" in strength:
-            strong_rows.append(base)
+        strength = str(item.get("mapping_strength") or "情绪映射")
+        daily = change(asset) or 0
+        if "强" in strength and daily > 0:
+            action = "适合追强但只看承接，强者恒强同时注意高位分歧"
+        elif "强" in strength:
+            action = "强映射但隔夜承压，承接为主，不追高"
+        elif "弱" in strength:
+            action = "仅情绪验证，等待国内订单/政策确认"
         else:
-            other_rows.append([base[0], strength, base[2], base[3], base[4]])
-    return strong_rows, other_rows
+            action = "情绪映射，不作为盘前主攻方向"
+        rows.append([f"{item.get('us_name', ticker)} {fmt_percent(asset.get('daily_change'))}", item.get("a_h_mapping", "AI链/成长方向"), action])
+    if not rows:
+        rows.append(["美股AI链信号", "光模块/服务器/PCB/半导体/AI应用", "等待开盘承接确认，不追高"])
+    return rows
 
 
-def ah_mapping_table(config: dict[str, Any], stocks: list[dict[str, Any]], etfs: list[dict[str, Any]]) -> str:
-    strong_rows, other_rows = ah_rows(config, stocks, etfs)
-    parts = [
-        "#### 强映射方向",
-        markdown_table(["美股线索", "主题", "美股表现", "A/H方向", "盘前动作"], strong_rows),
-        "#### 弱映射 / 情绪映射",
-        markdown_table(["美股线索", "映射强度", "美股表现", "A/H方向", "盘前动作"], other_rows),
-    ]
-    return "\n\n".join(parts)
-
-
-def update_matrix(index_assets: list[dict[str, Any]], etfs: list[dict[str, Any]], stocks: list[dict[str, Any]], news_items: list[dict[str, Any]], market_meta: dict[str, Any]) -> str:
-    ai_news = filter_news_by_tag(news_items, "AI")
-    macro_news = filter_news_by_tag(news_items, "宏观")
-    geo_news = filter_news_by_tag(news_items, "地缘")
-    stock_breadth = breadth(valid_assets(stocks))
-    regime = market_regime(index_assets + etfs, stocks)
+def update_matrix(index_assets: list[dict[str, Any]], etfs: list[dict[str, Any]], stocks: list[dict[str, Any]], ai_news: list[dict[str, Any]], macro_degraded: bool) -> str:
+    regime = market_regime(index_assets + etfs + stocks)
+    stock_breadth = breadth([asset for asset in stocks if valid_asset(asset)])
     risk_status = "削弱" if regime["risk_off"] else "强化"
-    macro_status = "降级" if market_meta.get("macro_degraded") else "不变"
     rows = [
-        ["风险偏好取决于宽基扩散", market_tone(index_assets, stocks), risk_status, "若SPY/QQQ低开且VIX继续上行，AH不做全面追高"],
-        ["AI仍是最重要主线", f"科技观察池上涨 {stock_breadth['up']} 家、下跌 {stock_breadth['down']} 家；产业级AI新闻 {len(ai_news)} 条", "分化" if stock_breadth["down"] else "强化", "只追踪算力、HBM、AI网络、数据中心等强映射链"],
-        ["行业结构决定AH映射强度", sector_summary(etfs), "强化" if valid_assets(etfs) else "不变", "强映射方向看光模块、PCB、服务器、HBM、数据中心；弱映射仅验证情绪"],
-        ["宏观扰动仍需压估值", f"宏观/地缘新闻 {len(macro_news) + len(geo_news)} 条；{market_meta.get('macro_degraded_message', '宏观数据可用')}。", macro_status, "观察美债、美元、黄金、原油、铜、比特币联动"],
+        ["昨日A股结论：AI主线仍是最强观察口径", f"隔夜科技池上涨 {stock_breadth['up']} 家、下跌 {stock_breadth['down']} 家", "强化" if stock_breadth["up"] >= stock_breadth["down"] else "削弱", "优先看AI硬件、HBM、光模块、PCB、服务器承接"],
+        ["昨日A股结论：指数不宜脱离美股宽基外推", "VIX与SPY/QQQ共同决定风险偏好", risk_status, "若宽基弱而AI强，只做结构，不做全面追高"],
+        ["昨日A股结论：产业催化只在高相关时update", f"高相关AI产业新闻 {len(ai_news)} 条", "强化" if ai_news else "不变", "只把公司级催化映射到个股，产业级催化映射到链条"],
+        ["昨日A股结论：宏观变量影响估值弹性", "利率/美元关键项" + ("缺失，宏观判断降级" if macro_degraded else "可用于验证"), "削弱" if macro_degraded else "不变", "宏观不完整时降低指数级结论权重"],
     ]
-    return markdown_table(["昨日判断", "隔夜新事实", "状态", "今日盘前动作"], rows)
+    return markdown_table(["昨日A股结论", "隔夜最新事实", "状态", "今日盘前动作"], rows)
 
 
-def final_watchlist(etfs: list[dict[str, Any]], stocks: list[dict[str, Any]], news_items: list[dict[str, Any]], market_meta: dict[str, Any]) -> list[str]:
-    regime = market_regime(etfs, stocks)
-    ranked_stocks = rank_by_metric(valid_assets(stocks), "daily_change", reverse=True)
-    lead_stock = asset_title(ranked_stocks[0]) if ranked_stocks else "相对强势科技股"
-    ai_count = len(filter_news_by_tag(news_items, "AI"))
-    headline = "AH整体情绪：偏谨慎，结构分化强于全面风险偏好修复；先看强映射链承接，不做指数级乐观外推。" if regime["risk_off"] else "AH整体情绪：边际修复，但仍需要开盘成交和行业扩散验证。"
-    if market_meta.get("macro_degraded"):
-        headline += " 宏观利率/美元数据缺失，宏观判断降级。"
-    return [
-        f"- {headline}",
-        f"- 最强映射方向：围绕 {lead_stock} 所在链条，优先看AI算力、HBM/存储、AI网络、光模块、PCB、服务器、液冷、数据中心。",
-        "- 不追高方向：大型科技权重若拖累宽基，弱映射的软件、云、港股互联网只做情绪验证；没有ETF和成交扩散前不做全面追高。",
-        "- 风险点：VIX继续上行、美债/美元反向扰动、地缘科技和出口管制消息，都会压制估值和AH风险偏好。",
-        f"- 盘前关注：产业级AI新闻 {ai_count} 条的真实映射方向、SMH/SOXX相对SPY、IWM小盘承接、TSLA机器人/自动驾驶、港股互联网情绪验证。",
+def final_judgement(index_assets: list[dict[str, Any]], stocks: list[dict[str, Any]], macro_degraded: bool) -> list[str]:
+    regime = market_regime(index_assets + stocks)
+    lead = rank_by_metric([asset for asset in stocks if valid_asset(asset)], "daily_change", reverse=True)
+    lead_text = asset_title(lead[0]) if lead else "AI链强映射方向"
+    mood = "偏谨慎、结构分化" if regime["risk_off"] else "偏多但需要扩散确认"
+    lines = [
+        f"1. AH整体情绪：{mood}，不把单个半导体或软件异动外推成全面风险偏好回暖。",
+        f"2. 主线共振确认：若 {lead_text} 所在链条开盘有承接，优先看AI硬件、HBM/存储、AI网络、光模块、PCB、服务器。",
+        "3. 盘前最优先方向：强映射链条先于弱映射软件，强成交先于低位补涨。",
+        "4. 只看承接、不追高：大型科技或宽基承压时，AH只做结构强弱，不做指数级乐观外推。",
+        "5. 防兑现/风险提示：VIX上行、美元/美债反向扰动、地缘科技与出口管制消息，都会压制估值弹性。",
     ]
+    if macro_degraded:
+        lines.append("6. 宏观利率/美元数据缺失，本期宏观判断降级，盘前降低指数级结论权重。")
+    return lines
 
 
 def report_date_from_metadata(market_data: dict[str, Any]) -> tuple[str, str]:
     fetched_at = market_data.get("metadata", {}).get("fetched_at") or datetime.now().isoformat(timespec="minutes")
     clean = str(fetched_at).replace("T", " ")
-    return clean[:10], clean[:16]
+    date_text = clean[:10]
+    try:
+        dt = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00"))
+    except ValueError:
+        dt = datetime.now()
+    return f"{dt.year}年{dt.month}月{dt.day}日", clean[:16]
+
+
+def footnote(market_data: dict[str, Any], news_data: dict[str, Any]) -> str:
+    metadata = market_data.get("metadata", {})
+    fetched = str(metadata.get("fetched_at") or "")[:16]
+    text = f"行情与公开新闻自动整理，数据获取时间 {fetched}；技术明细见服务器日志。仅供研究参考，不构成投资建议。"
+    for term in BANNED_FOOTNOTE_WORDS:
+        text = text.replace(term, "")
+    return text
 
 
 def build_markdown_report(config: dict[str, Any], market_data: dict[str, Any], news_data: dict[str, Any]) -> str:
-    market_meta = market_data.get("metadata", {})
     news_items = news_data.get("items", [])
     report_date, generated_minute = report_date_from_metadata(market_data)
+    meta = market_data.get("metadata", {})
 
     index_assets = pick_assets(assets_by_category(market_data, "index"), INDEX_ORDER)
-    sector_assets = assets_by_category(market_data, "sector_etf")
-    macro_assets = pick_assets(assets_by_category(market_data, "macro_asset"), MACRO_ASSETS)
-    tradable_assets = index_assets + sector_assets + macro_assets
-    focus_etfs = pick_assets(tradable_assets, FOCUS_ETFS)
+    etfs = assets_by_category(market_data, "sector_etf") + [asset for asset in index_assets if asset.get("ticker") in {"SPY", "QQQ", "IWM", "SMH", "SOXX"}]
     stocks = assets_by_category(market_data, "key_stock")
-    mega_tech = pick_assets(stocks, MEGA_TECH)
-    hardware_assets = pick_assets(stocks, AI_HARDWARE)
-    app_assets = pick_assets(stocks, AI_APPS)
-    ai_assets = pick_assets(stocks, AI_CHAIN)
+    macro_assets = pick_assets(assets_by_category(market_data, "macro_asset"), MACRO_ASSETS)
+    macro_news = filter_news(news_items, "宏观")
+    china_news = [item for item in filter_news(news_items, "中概/AH") if "地缘" not in set(item.get("tags", []))]
+    geo_news = filter_news(news_items, "地缘")
+    ai_news = [item for item in filter_news(news_items, "AI") if "产业级" in set(item.get("classification", []))]
+    macro_degraded = bool(meta.get("macro_degraded"))
 
-    ai_news = filter_news_by_tag(news_items, "AI")
-    macro_news = filter_news_by_tag(news_items, "宏观")
-    china_news = [item for item in filter_news_by_tag(news_items, "中概/AH") if "地缘" not in set(item.get("tags", []))]
-    geo_news = filter_news_by_tag(news_items, "地缘")
-    macro_degraded = bool(market_meta.get("macro_degraded"))
-    macro_intro = "判断：宏观利率/美元数据缺失，宏观判断降级；本节只保留已取得的大宗和风险资产，不输出正式宏观方向。" if macro_degraded else "判断：宏观变量决定估值弹性，地缘科技消息决定AI链风险溢价，二者都不能用单条新闻直接替代行情判断。"
-    macro_trade = "交易含义：US10Y/DXY 缺失时，不对利率、美元和估值方向做正式判断；等待数据补齐后再确认AH成长/价值切换。" if macro_degraded else "交易含义：美债、美元、黄金、原油、铜、比特币共同决定估值、通胀和风险偏好的边际方向。"
-    macro_us_impact = "降级：等待US10Y/DXY补齐后再确认利率和美元对估值的影响。" if macro_degraded else "利率和降息预期仍是估值锚，科技股对收益率变化更敏感。"
-    macro_ah_impact = "降级：AH成长/恒生科技只做情绪观察，不做宏观方向外推。" if macro_degraded else "若美债利率下行，AH成长与恒生科技情绪更容易修复；若利率上行，则偏压制估值。"
-
-    title = f"{report_date} 美股复盘（昨夜）"
-    data_line = f"生成时间：{generated_minute} | 数据：{market_meta.get('source', '行情源')} + 公开新闻 | 分析：{config.get('report', {}).get('author', 'AI投研 · 美股版')}"
+    macro_asset_line = "；".join(f"{asset_name(asset)} {fmt_percent(asset.get('daily_change'))}" for asset in macro_assets[:7]) or "宏观资产数据暂缺"
+    china_line = china_news[0].get("title") if china_news else "昨夜中国经济及政策无重大增量，AH更多受美股结构和自身主线承接影响。"
+    cut_view = "降息预期一句话判断：若利率数据回落，成长估值弹性修复；若利率/美元走强，则压制大型科技和AH成长。"
+    if macro_degraded:
+        cut_view = "降息预期一句话判断：宏观利率/美元数据缺失，本节判断降级，等待数据补齐后再确认。"
 
     sections = [
-        f"# {title}", data_line, "", source_note(market_data), "", one_sentence(focus_etfs, stocks), "",
-        "## 一、美股指数概况", "", market_tone(index_assets, stocks), "", price_table(index_assets), "", "交易含义：宽基承压且VIX上行时，AH不宜按全面风险偏好修复交易；若半导体局部强势，只能映射到强产业链。", "",
-        "### 三个问题回答", "", three_questions(focus_etfs + index_assets), "",
-        "## 二、宏观与地缘", "", macro_intro, "", "### 宏观利率与大宗商品", price_table(macro_assets), "", macro_trade, "",
-        macro_block("美国经济及美联储降息", macro_news, macro_us_impact, macro_ah_impact),
-        macro_block("中国经济及政策", china_news, "中概和跨国消费链更敏感，但不替代美股自身业绩线索。", "政策和中概风险偏好会影响港股互联网、恒生科技和A股平台经济映射。"),
-        macro_block("地缘冲突 / 地缘科技", geo_news, "地缘升温通常提高避险和油金波动，出口管制会提高AI链风险溢价。", "油价、黄金和地缘科技消息会影响AH资源品、半导体设备、AI硬件和出口链风险偏好。"),
-        "## 三、行业与 ETF 结构", "", sector_summary(focus_etfs), "", flow_direction(focus_etfs), "", price_table(focus_etfs), "", "交易含义：本节不只看涨跌幅，更看成长/价值、大盘/小盘、科技/半导体/能源/金融/防御之间的资金切换。", "",
-        "## 四、美股科技股跟踪", "", "判断：科技股必须拆成大型平台、AI硬件、AI应用三层，不能把单一个股或单一新闻误读成整条AI链共振。", "", grouped_stock_table("大型科技股", stocks, MEGA_TECH, news_items), "", grouped_stock_table("半导体 / AI硬件", stocks, AI_HARDWARE, news_items), "", grouped_stock_table("AI应用 / SaaS", stocks, AI_APPS, news_items), "", "### 科技股异动总表", price_table(mega_tech + hardware_assets + app_assets), "", "交易含义：大型科技承压时压制指数，但若MU/MRVL/AVGO等硬件链逆势，AH只做结构映射，不做全面乐观。", "",
-        "## 五、AI主线与重要催化", "", "判断：AI主线要按算力、半导体、云厂商、应用、端侧分层，产业新闻只作为催化，不能替代个股行情。", "", ai_layered_summary(stocks, focus_etfs, ai_news), "", price_table(ai_assets), "", "### 重要信息 / AI产业催化", news_bullets(ai_news, limit=10), "", "交易含义：产业级新闻进入主题判断，公司级新闻才进入个股异动归因；无明确公司级催化时不强行解释个股涨跌。", "",
-        "## 六、AH盘前映射", "", "判断：AH盘前只对强映射方向给动作，弱映射和情绪映射必须等待A股/港股开盘验证。", "", "### 美股映射", ah_mapping_table(config, stocks, focus_etfs), "", "### A股/港股盘前参考", "- 强映射：AI芯片、半导体ETF、HBM/存储、AI网络、光模块、PCB、服务器、液冷、数据中心。", "- 弱映射：云厂商、AI软件、SaaS更多影响AI应用和软件情绪，需要结合国内订单和政策验证。", "- 情绪映射：特斯拉链、机器人、自动驾驶和港股互联网更多影响风险偏好，不宜直接替代AH基本面判断。", "", "交易含义：强映射可关注但等承接，弱映射仅情绪验证，情绪映射不追高。", "",
-        "## 七、Update Matrix", "", update_matrix(index_assets, focus_etfs, stocks, news_items, market_meta), "",
-        "## 八、最终结论", "", *final_watchlist(focus_etfs, stocks, news_items, market_meta), "",
-        "---", "风险提示：本报告仅基于已获取的行情源和公开新闻自动生成，不构成投资建议；盘后财报、监管新闻、宏观数据和流动性变化可能改变结论。", source_note(market_data),
+        f"# 美股复盘 · {report_date}",
+        f"生成时间：{generated_minute}",
+        "",
+        "## 一、美股指数概况",
+        headline_judgement(index_assets, stocks),
+        "",
+        index_table(index_assets),
+        "",
+        one_sentence(index_assets, stocks),
+        ma20_sentence(index_assets),
+        "",
+        three_questions(index_assets),
+        "",
+        "## 二、宏观与地缘",
+        "### 2.1 美国经济及美联储降息",
+        "宏观定价的核心仍是利率、美元与通胀预期，对成长股估值弹性最敏感。" if not macro_degraded else "宏观利率/美元数据缺失，宏观判断降级，本节只保留公开新闻与大类资产线索。",
+        macro_event_table(macro_news),
+        cut_view,
+        f"宏观资产线索：{macro_asset_line}。",
+        "",
+        "### 2.2 中国经济及政策",
+        str(china_line)[:160],
+        "对A股/港股影响：若无政策新增，盘前主要跟随美股AI链、港股互联网和人民币/美元情绪；有政策新增时再单独update。",
+        "",
+        "### 2.3 地缘冲突",
+        geopolitics_table(geo_news),
+        "结论：地缘扰动主要影响油气、黄金、航运和科技出口管制风险；若油金同强且VIX上行，AH风险偏好应降级。",
+        "",
+        "## 三、行业与ETF结构",
+        "### 3.1 行业涨跌结构",
+        sector_bullets(etfs, stocks),
+        "",
+        "### 3.2 ETF结构",
+        etf_structure_table(etfs),
+        "判断：ETF只看关键口径，不把所有技术指标堆进正文；QQQ/SPY决定成长相对宽基，SMH/SOXX决定AI硬件强弱。",
+        "",
+        "## 四、美股科技股跟踪",
+        "### 4.1 大型科技股（Magnificent 7）",
+        megatech_table(stocks, news_items),
+        "结论：大型科技决定指数方向，若权重股承压，即使局部AI硬件走强，也只能定义为结构分化。",
+        "",
+        "### 4.2 自选美股异动",
+        movers_bullets(stocks, news_items),
+        "",
+        "### 4.3 AI主线跟踪",
+        "昨夜是否有新增 AI 关键业绩/指引：若未匹配到明确公司级催化，则以价格、ETF和产业级新闻交叉验证，不强行归因。",
+        ai_three_questions(stocks, etfs),
+        "",
+        "### 4.4 重要信息 / AI产业催化",
+        ai_catalyst_table(ai_news),
+        "",
+        "## 五、AH盘前参考",
+        "### 5.1 美股映射",
+        markdown_table(["美股信号/异动", "AH映射方向", "盘前判断"], ah_mapping_rows(config, stocks, etfs)),
+        "",
+        "### 5.2 盘前参考",
+        "总判断：AH盘前不看满屏数据，重点看美股最大边际变化是否能映射到A股/港股的可交易方向；强映射看承接，弱映射只做情绪验证。",
+        "",
+        "#### Update Matrix",
+        update_matrix(index_assets, etfs, stocks, ai_news, macro_degraded),
+        "",
+        "#### 最终判断",
+        *final_judgement(index_assets, stocks, macro_degraded),
+        "",
+        footnote(market_data, news_data),
     ]
-    return "\n".join(sections).strip() + "\n"
+    return "\n\n".join(section for section in sections if section is not None).strip() + "\n"
