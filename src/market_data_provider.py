@@ -56,8 +56,8 @@ def normalize_history_frame(frame: pd.DataFrame) -> pd.DataFrame:
     clean = frame.copy()
     if "Date" in clean.columns or "Datetime" in clean.columns:
         date_column = "Date" if "Date" in clean.columns else "Datetime"
-        clean[date_column] = pd.to_datetime(clean[date_column])
-        clean = clean.set_index(date_column)
+        clean[date_column] = pd.to_datetime(clean[date_column], errors="coerce")
+        clean = clean.dropna(subset=[date_column]).set_index(date_column)
     clean = clean.sort_index()
     clean.index.name = "Date"
     return clean
@@ -96,7 +96,7 @@ def safe_float(value: Any) -> float | None:
         pass
     if isinstance(value, str):
         value = value.strip().replace("%", "")
-        if value == "":
+        if not value:
             return None
     try:
         return float(value)
@@ -119,6 +119,31 @@ def classify_http_error(status_code: int, text: str) -> str:
     return "schema_parse_error"
 
 
+def quote_metadata(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "company_name": raw.get("name") or raw.get("companyName") or raw.get("company_name") or raw.get("shortName") or raw.get("description") or "",
+        "exchange": raw.get("exchange") or raw.get("exchangeShortName") or raw.get("mic_code") or raw.get("primaryExchange") or "",
+        "currency": raw.get("currency") or raw.get("currency_name") or raw.get("currencySymbol") or "",
+    }
+
+
+def quote_date(raw: dict[str, Any]) -> pd.Timestamp:
+    for key in ("date", "datetime", "timestamp", "time"):
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            if isinstance(value, (int, float)):
+                ts = pd.to_datetime(value, unit="s", utc=True).tz_convert(None)
+            else:
+                ts = pd.to_datetime(value, utc=True).tz_convert(None)
+            if not pd.isna(ts):
+                return pd.Timestamp(ts).normalize()
+        except Exception:
+            continue
+    return utc_now_naive().normalize()
+
+
 def quote_to_frame(quote: MarketQuote, provider_key: str, quote_only: bool = True) -> pd.DataFrame:
     previous_close = quote.previous_close
     if previous_close is None and quote.change is not None:
@@ -126,17 +151,23 @@ def quote_to_frame(quote: MarketQuote, provider_key: str, quote_only: bool = Tru
     if previous_close is None and quote.change_percent not in (None, -100):
         previous_close = quote.price / (1 + quote.change_percent / 100)
 
-    today = utc_now_naive().normalize()
+    as_of = quote_date(quote.raw)
     rows: list[dict[str, Any]] = []
     if previous_close not in (None, 0):
-        rows.append({"Date": today - pd.Timedelta(days=1), "Close": previous_close, "Volume": None})
-    rows.append({"Date": today, "Close": quote.price, "Volume": quote.volume})
+        rows.append({"Date": as_of - pd.Timedelta(days=1), "Close": previous_close, "Volume": None})
+    rows.append({"Date": as_of, "Close": quote.price, "Volume": quote.volume})
     frame = normalize_history_frame(pd.DataFrame(rows))
-    frame.attrs["quote_success"] = True
-    frame.attrs["provider_symbol"] = quote.symbol
-    frame.attrs[f"{provider_key}_symbol"] = quote.symbol
-    frame.attrs["quote_only"] = quote_only
-    frame.attrs[f"{provider_key}_quote_only"] = quote_only
+    metadata = quote_metadata(quote.raw)
+    frame.attrs.update(
+        {
+            "quote_success": True,
+            "provider_symbol": quote.symbol,
+            f"{provider_key}_symbol": quote.symbol,
+            "quote_only": quote_only,
+            f"{provider_key}_quote_only": quote_only,
+            **metadata,
+        }
+    )
     return frame
 
 
@@ -145,12 +176,8 @@ class FMPProvider:
     base_url = "https://financialmodelingprep.com/stable"
     default_symbol_map = {
         "^GSPC": "SPY", "^SPX": "SPY", "^IXIC": "QQQ", "^NDX": "QQQ", "^DJI": "DIA", "^RUT": "IWM",
-        "^SOX": "SMH", "^VIX": "^VIX", "^TNX": "^TNX", "SPY": "SPY", "QQQ": "QQQ", "DIA": "DIA",
-        "IWM": "IWM", "SMH": "SMH", "SOXX": "SOXX", "XLK": "XLK", "XLE": "XLE", "XLF": "XLF",
-        "XLV": "XLV", "TLT": "TLT", "GLD": "GLD", "USO": "USO", "CPER": "CPER", "VIX": "^VIX",
-        "US10Y": "^TNX", "DXY": "DX-Y.NYB", "BTCUSD": "BTCUSD", "BTC-USD": "BTCUSD", "NVDA": "NVDA",
-        "AMD": "AMD", "AVGO": "AVGO", "MSFT": "MSFT", "GOOGL": "GOOGL", "META": "META", "AMZN": "AMZN",
-        "AAPL": "AAPL", "TSLA": "TSLA", "MU": "MU", "MRVL": "MRVL", "ARM": "ARM", "SNOW": "SNOW", "NOW": "NOW",
+        "^SOX": "SMH", "^VIX": "^VIX", "^TNX": "^TNX", "VIX": "^VIX", "US10Y": "^TNX", "DXY": "DX-Y.NYB",
+        "BTCUSD": "BTCUSD", "BTC-USD": "BTCUSD",
     }
 
     def __init__(
@@ -171,7 +198,6 @@ class FMPProvider:
         self.base_url = (base_url or self.base_url).rstrip("/")
         self.session = requests.Session()
         self.quote_cache: dict[str, MarketQuote] = {}
-        self.prefetch_error: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -184,31 +210,12 @@ class FMPProvider:
         return bool(str(options.get("api_key") or os.getenv(api_key_env, "")).strip())
 
     def api_key_metadata(self, env_path: str | Path = ".env") -> dict[str, Any]:
-        raw_env_value: str | None = None
-        path = Path(env_path)
-        if path.exists():
-            try:
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    if line.startswith(f"{self.api_key_env}="):
-                        raw_env_value = line.split("=", 1)[1]
-                        break
-            except OSError:
-                raw_env_value = None
-        env_value = str(self.api_key_raw or "")
-        return {
-            "env_name": self.api_key_env,
-            "exists": bool(self.api_key),
-            "length": len(env_value),
-            "trimmed_length": len(self.api_key),
-            "has_outer_whitespace": (raw_env_value is not None and raw_env_value != raw_env_value.strip()) or env_value != env_value.strip(),
-            "loaded_from_dotenv": raw_env_value is not None,
-        }
+        return api_key_metadata(self.api_key_env, self.api_key_raw, self.api_key, env_path)
 
     def fmp_symbol(self, ticker: str) -> str:
         if ticker in self.symbol_map:
             return self.symbol_map[ticker]
-        cleaned = ticker.strip().replace("-", ".").upper()
-        return self.symbol_map.get(cleaned, cleaned)
+        return ticker.strip().replace("-", ".").upper()
 
     def redacted_url(self, path: str, params: dict[str, Any]) -> str:
         visible = {**params, "apikey": "***"}
@@ -227,7 +234,6 @@ class FMPProvider:
             )
         except requests.RequestException as exc:
             raise FMPProviderError("network_error", f"{endpoint_type}: {exc}") from exc
-
         text = response.text or ""
         if response.status_code >= 400:
             raise FMPProviderError(classify_http_error(response.status_code, text), f"{endpoint_type}: HTTP {response.status_code}", response.status_code)
@@ -293,8 +299,6 @@ class FMPProvider:
                 symbols.append(symbol)
         for start in range(0, len(symbols), self.quote_batch_size):
             chunk = symbols[start : start + self.quote_batch_size]
-            if not chunk:
-                continue
             payload, _, _ = self._request_json("batch_quote", "batch-quote", {"symbols": ",".join(chunk)})
             rows = payload if isinstance(payload, list) else [payload]
             for row in rows:
@@ -310,10 +314,7 @@ class FMPProvider:
         return self.quote_cache
 
     def quote_to_frame(self, quote: MarketQuote) -> pd.DataFrame:
-        frame = quote_to_frame(quote, "fmp", quote_only=True)
-        frame.attrs["fmp_quote_only"] = True
-        frame.attrs["fmp_symbol"] = quote.symbol
-        return frame
+        return quote_to_frame(quote, "fmp", quote_only=True)
 
     def _historical_rows(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
@@ -355,7 +356,9 @@ class FMPProvider:
             raise ValueError("FMP provider only supports daily history")
         quote = self.fetch_quote(ticker)
         try:
-            return self.fetch_historical_frame(ticker, period)
+            frame = self.fetch_historical_frame(ticker, period)
+            frame.attrs.update(quote_metadata(quote.raw))
+            return frame
         except FMPProviderError as exc:
             frame = self.quote_to_frame(quote)
             frame.attrs["historical_error_category"] = exc.category
@@ -399,10 +402,148 @@ class FMPProvider:
         return result
 
 
+class FinnhubProvider:
+    name = "Finnhub"
+    base_url = "https://finnhub.io/api/v1"
+    default_symbol_map = {
+        "VIX": "^VIX", "US10Y": "^TNX", "DXY": "DXY", "BTCUSD": "BINANCE:BTCUSDT", "BTC-USD": "BINANCE:BTCUSDT",
+    }
+
+    def __init__(self, symbol_map: dict[str, str] | None = None, api_key: str | None = None, api_key_env: str = "FINNHUB_API_KEY", timeout: int = 12, base_url: str | None = None) -> None:
+        self.symbol_map = {**self.default_symbol_map, **(symbol_map or {})}
+        self.api_key_env = api_key_env or "FINNHUB_API_KEY"
+        self.api_key_raw = api_key if api_key is not None else os.getenv(self.api_key_env, "")
+        self.api_key = str(self.api_key_raw).strip()
+        self.timeout = max(1, min(int(timeout or 12), 15))
+        self.base_url = (base_url or self.base_url).rstrip("/")
+        self.session = requests.Session()
+        self.quote_cache: dict[str, MarketQuote] = {}
+        self.profile_cache: dict[str, dict[str, Any]] = {}
+
+    @classmethod
+    def is_configured(cls, options: dict[str, Any] | None = None) -> bool:
+        options = options or {}
+        api_key_env = str(options.get("api_key_env") or "FINNHUB_API_KEY")
+        return bool(str(options.get("api_key") or os.getenv(api_key_env, "")).strip())
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.api_key)
+
+    def api_key_metadata(self, env_path: str | Path = ".env") -> dict[str, Any]:
+        return api_key_metadata(self.api_key_env, self.api_key_raw, self.api_key, env_path)
+
+    def fh_symbol(self, ticker: str) -> str:
+        if ticker in self.symbol_map:
+            return self.symbol_map[ticker]
+        return ticker.strip().upper()
+
+    def _request_json(self, endpoint_type: str, path: str, params: dict[str, Any]) -> Any:
+        if not self.enabled:
+            raise MarketProviderError("missing_api_key", "FINNHUB_API_KEY is not configured")
+        try:
+            response = self.session.get(
+                f"{self.base_url}/{path.lstrip('/')}",
+                params={**params, "token": self.api_key},
+                headers={"User-Agent": "us-market-review/0.1"},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise MarketProviderError("network_error", f"{endpoint_type}: {exc}") from exc
+        text = response.text or ""
+        if response.status_code >= 400:
+            raise MarketProviderError(classify_http_error(response.status_code, text), f"{endpoint_type}: HTTP {response.status_code}", response.status_code)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise MarketProviderError("schema_parse_error", f"{endpoint_type}: invalid JSON", response.status_code) from exc
+        if isinstance(payload, dict) and payload.get("error"):
+            raise MarketProviderError(classify_http_error(response.status_code, str(payload.get("error"))), f"{endpoint_type}: {payload.get('error')}", response.status_code)
+        if payload in (None, "", [], {}):
+            raise MarketProviderError("empty_response", f"{endpoint_type}: empty response", response.status_code)
+        return payload
+
+    def fetch_profile(self, ticker: str) -> dict[str, Any]:
+        symbol = self.fh_symbol(ticker)
+        if symbol in self.profile_cache:
+            return self.profile_cache[symbol]
+        try:
+            payload = self._request_json("profile", "stock/profile2", {"symbol": symbol})
+            profile = payload if isinstance(payload, dict) else {}
+        except MarketProviderError:
+            profile = {}
+        self.profile_cache[symbol] = profile
+        return profile
+
+    def fetch_quote(self, ticker: str) -> MarketQuote:
+        symbol = self.fh_symbol(ticker)
+        if symbol in self.quote_cache:
+            return self.quote_cache[symbol]
+        payload = self._request_json("quote", "quote", {"symbol": symbol})
+        if not isinstance(payload, dict):
+            raise MarketProviderError("schema_parse_error", "quote: unexpected response schema")
+        price = safe_float(payload.get("c"))
+        previous_close = safe_float(payload.get("pc"))
+        if price is None or price == 0:
+            raise MarketProviderError("empty_response", "quote: missing current price")
+        raw = {**payload, **self.fetch_profile(ticker)}
+        quote = MarketQuote(symbol, price, previous_close, safe_float(payload.get("d")), safe_float(payload.get("dp")), None, raw)
+        self.quote_cache[symbol] = quote
+        return quote
+
+    def quote_to_frame(self, quote: MarketQuote) -> pd.DataFrame:
+        return quote_to_frame(quote, "finnhub", quote_only=True)
+
+    def fetch_historical_frame(self, ticker: str, period: str) -> pd.DataFrame:
+        symbol = self.fh_symbol(ticker)
+        days = period_to_days(period) or 90
+        now = utc_now_naive()
+        payload = self._request_json(
+            "stock_candle",
+            "stock/candle",
+            {"symbol": symbol, "resolution": "D", "from": int((now - pd.Timedelta(days=days + 8)).timestamp()), "to": int(now.timestamp())},
+        )
+        if not isinstance(payload, dict) or payload.get("s") != "ok":
+            raise MarketProviderError("empty_response", "stock_candle: empty or non-ok response")
+        closes = payload.get("c") or []
+        timestamps = payload.get("t") or []
+        if not closes or not timestamps:
+            raise MarketProviderError("empty_response", "stock_candle: empty candles")
+        frame = pd.DataFrame(
+            {
+                "Date": pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(None),
+                "Open": payload.get("o") or [None] * len(closes),
+                "High": payload.get("h") or [None] * len(closes),
+                "Low": payload.get("l") or [None] * len(closes),
+                "Close": closes,
+                "Volume": payload.get("v") or [None] * len(closes),
+            }
+        )
+        for column in ["Open", "High", "Low", "Close", "Volume"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = normalize_history_frame(frame)
+        frame.attrs.update({"quote_success": True, "provider_symbol": symbol, "finnhub_symbol": symbol, "quote_only": False, **quote_metadata(self.fetch_profile(ticker))})
+        return frame
+
+    def fetch_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
+        if interval not in {"1d", "1D", "d", "D"}:
+            raise ValueError("Finnhub provider only supports daily history")
+        quote = self.fetch_quote(ticker)
+        try:
+            frame = self.fetch_historical_frame(ticker, period)
+            frame.attrs.update(quote_metadata(quote.raw))
+            return frame
+        except MarketProviderError as exc:
+            frame = self.quote_to_frame(quote)
+            frame.attrs["historical_error_category"] = exc.category
+            frame.attrs["historical_error"] = str(exc)
+            return frame
+
+
 class TwelveDataProvider:
     name = "Twelve Data"
     base_url = "https://api.twelvedata.com"
-    default_symbol_map = {"VIX": "VIX", "US10Y": "TNX", "DXY": "DXY", "BTCUSD": "BTC/USD", "BTC-USD": "BTC/USD", "USO": "USO", "GLD": "GLD", "CPER": "CPER"}
+    default_symbol_map = {"VIX": "VIX", "US10Y": "TNX", "DXY": "DXY", "BTCUSD": "BTC/USD", "BTC-USD": "BTC/USD"}
 
     def __init__(self, symbol_map: dict[str, str] | None = None, api_key: str | None = None, api_key_env: str = "TWELVE_DATA_API_KEY", timeout: int = 12, base_url: str | None = None) -> None:
         self.symbol_map = {**self.default_symbol_map, **(symbol_map or {})}
@@ -423,6 +564,9 @@ class TwelveDataProvider:
     @property
     def enabled(self) -> bool:
         return bool(self.api_key)
+
+    def api_key_metadata(self, env_path: str | Path = ".env") -> dict[str, Any]:
+        return api_key_metadata(self.api_key_env, self.api_key_raw, self.api_key, env_path)
 
     def td_symbol(self, ticker: str) -> str:
         if ticker in self.symbol_map:
@@ -490,7 +634,9 @@ class TwelveDataProvider:
             raise ValueError("Twelve Data provider only supports daily history")
         quote = self.fetch_quote(ticker)
         try:
-            return self.fetch_historical_frame(ticker, period)
+            frame = self.fetch_historical_frame(ticker, period)
+            frame.attrs.update(quote_metadata(quote.raw))
+            return frame
         except MarketProviderError as exc:
             frame = self.quote_to_frame(quote)
             frame.attrs["historical_error_category"] = exc.category
@@ -509,17 +655,19 @@ class YFinanceProvider:
         return self.symbol_map.get(ticker, ticker)
 
     def fetch_history(self, ticker: str, period: str, interval: str) -> pd.DataFrame:
-        frame = yf.Ticker(self.yf_symbol(ticker)).history(period=period, interval=interval, auto_adjust=False)
-        return normalize_history_frame(frame)
+        symbol = self.yf_symbol(ticker)
+        frame = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+        frame = normalize_history_frame(frame)
+        frame.attrs.update({"quote_success": True, "provider_symbol": symbol, "quote_only": False})
+        return frame
 
 
 class StooqProvider:
     name = "Stooq daily CSV"
     base_url = "https://stooq.com/q/d/l/"
     default_symbol_map = {
-        "^GSPC": "spy.us", "^SPX": "spy.us", "^IXIC": "qqq.us", "^NDX": "qqq.us", "^DJI": "dia.us", "^RUT": "iwm.us", "^SOX": "smh.us", "^VIX": "^vix", "^TNX": "10usy.b",
-        "SPY": "spy.us", "QQQ": "qqq.us", "DIA": "dia.us", "IWM": "iwm.us", "SMH": "smh.us", "SOXX": "soxx.us", "XLK": "xlk.us", "XLE": "xle.us", "XLF": "xlf.us", "XLV": "xlv.us",
-        "TLT": "tlt.us", "GLD": "gld.us", "USO": "uso.us", "CPER": "cper.us", "VIX": "^vix", "US10Y": "10usy.b", "DXY": "dx.f", "BTCUSD": "btcusd", "BTC-USD": "btcusd",
+        "SPY": "spy.us", "QQQ": "qqq.us", "DIA": "dia.us", "IWM": "iwm.us", "SMH": "smh.us", "SOXX": "soxx.us", "XLK": "xlk.us", "XLF": "xlf.us", "XLE": "xle.us", "XLV": "xlv.us",
+        "TLT": "tlt.us", "GLD": "gld.us", "USO": "uso.us", "CPER": "cper.us", "VIX": "^vix", "US10Y": "10usy.b", "DXY": "dx.f", "BTCUSD": "btcusd",
         "NVDA": "nvda.us", "AMD": "amd.us", "AVGO": "avgo.us", "MSFT": "msft.us", "GOOGL": "googl.us", "META": "meta.us", "AMZN": "amzn.us", "AAPL": "aapl.us", "TSLA": "tsla.us",
         "MU": "mu.us", "MRVL": "mrvl.us", "ARM": "arm.us", "SNOW": "snow.us", "NOW": "now.us",
     }
@@ -552,7 +700,30 @@ class StooqProvider:
         days = period_to_days(period)
         if days:
             frame = frame[frame.index >= utc_now_naive() - pd.Timedelta(days=days + 5)]
+        frame.attrs.update({"quote_success": True, "provider_symbol": self.stooq_symbol(ticker), "quote_only": False})
         return frame
+
+
+def api_key_metadata(env_name: str, raw_value: Any, trimmed_value: str, env_path: str | Path = ".env") -> dict[str, Any]:
+    raw_env_value: str | None = None
+    path = Path(env_path)
+    if path.exists():
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.startswith(f"{env_name}="):
+                    raw_env_value = line.split("=", 1)[1]
+                    break
+        except OSError:
+            raw_env_value = None
+    env_value = str(raw_value or "")
+    return {
+        "env_name": env_name,
+        "exists": bool(trimmed_value),
+        "length": len(env_value),
+        "trimmed_length": len(trimmed_value),
+        "has_outer_whitespace": (raw_env_value is not None and raw_env_value != raw_env_value.strip()) or env_value != env_value.strip(),
+        "loaded_from_dotenv": raw_env_value is not None,
+    }
 
 
 def make_provider(name: str, options: dict[str, Any] | None = None) -> MarketDataProvider:
@@ -561,6 +732,9 @@ def make_provider(name: str, options: dict[str, Any] | None = None) -> MarketDat
     if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
         symbol_map = options.get("symbol_map") if isinstance(options.get("symbol_map"), dict) else None
         return FMPProvider(symbol_map=symbol_map, api_key=options.get("api_key"), api_key_env=str(options.get("api_key_env") or "FMP_API_KEY"), quote_batch_size=int(options.get("quote_batch_size") or 80), timeout=int(options.get("timeout") or 12), base_url=options.get("base_url"))
+    if normalized in {"finnhub", "finn_hub"}:
+        symbol_map = options.get("symbol_map") if isinstance(options.get("symbol_map"), dict) else None
+        return FinnhubProvider(symbol_map=symbol_map, api_key=options.get("api_key"), api_key_env=str(options.get("api_key_env") or "FINNHUB_API_KEY"), timeout=int(options.get("timeout") or 12), base_url=options.get("base_url"))
     if normalized in {"twelve_data", "twelvedata"}:
         symbol_map = options.get("symbol_map") if isinstance(options.get("symbol_map"), dict) else None
         return TwelveDataProvider(symbol_map=symbol_map, api_key=options.get("api_key"), api_key_env=str(options.get("api_key_env") or "TWELVE_DATA_API_KEY"), timeout=int(options.get("timeout") or 12), base_url=options.get("base_url"))
@@ -582,6 +756,8 @@ def provider_is_enabled(name: str, options: dict[str, Any] | None = None) -> boo
     options = options or {}
     if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
         return FMPProvider.is_configured(options)
+    if normalized in {"finnhub", "finn_hub"}:
+        return FinnhubProvider.is_configured(options)
     if normalized in {"twelve_data", "twelvedata"}:
         return TwelveDataProvider.is_configured(options)
     return True
@@ -591,6 +767,8 @@ def provider_display_name(name: str) -> str:
     normalized = name.strip().lower()
     if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
         return FMPProvider.name
+    if normalized in {"finnhub", "finn_hub"}:
+        return FinnhubProvider.name
     if normalized in {"twelve_data", "twelvedata"}:
         return TwelveDataProvider.name
     if normalized in {"cache", "local_cache", "local market cache"}:
@@ -604,6 +782,8 @@ def resolve_provider_symbol(name: str, ticker: str, options: dict[str, Any] | No
     symbol_map = options.get("symbol_map") if isinstance(options.get("symbol_map"), dict) else None
     if normalized in {"fmp", "financial_modeling_prep", "financialmodelingprep"}:
         return FMPProvider(symbol_map=symbol_map, api_key_env=str(options.get("api_key_env") or "FMP_API_KEY"), base_url=options.get("base_url")).fmp_symbol(ticker)
+    if normalized in {"finnhub", "finn_hub"}:
+        return FinnhubProvider(symbol_map=symbol_map, api_key_env=str(options.get("api_key_env") or "FINNHUB_API_KEY"), base_url=options.get("base_url")).fh_symbol(ticker)
     if normalized in {"twelve_data", "twelvedata"}:
         return TwelveDataProvider(symbol_map=symbol_map, api_key_env=str(options.get("api_key_env") or "TWELVE_DATA_API_KEY"), base_url=options.get("base_url")).td_symbol(ticker)
     if normalized == "stooq":
