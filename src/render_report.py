@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -36,12 +38,17 @@ KEY_TICKERS_FOR_FRESH_CACHE = [
 MACRO_DEGRADE_TICKERS = ["US10Y", "DXY"]
 MACRO_BLOCK_TICKERS = ["US10Y", "DXY", "TLT"]
 FORBIDDEN_REPORT_TERMS = [
+    "HTTP",
     "Too Many Requests",
+    "provider_chain",
+    "完整池行情可用",
+    "实时获取",
+    "缓存降级",
+    "失败 ticker",
     "HTTP 402",
     "HTTP 429",
     "no cache fallback available",
-    "attempt 1/",
-    "attempt 1 of",
+    "attempt",
     "抓取异常",
     "数据审计",
     "Traceback",
@@ -96,49 +103,95 @@ def output_dirs(config: dict[str, Any]) -> tuple[Path, Path, Path]:
     return markdown_dir, pdf_dir, html_dir
 
 
+def first_markdown_title(markdown_text: str) -> str:
+    for line in markdown_text.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip()
+    return "美股复盘"
+
+
+def generated_time(markdown_text: str) -> str:
+    match = re.search(r"生成时间[:：]\s*([^\n]+)", markdown_text)
+    return match.group(1).strip() if match else datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
 def markdown_to_html(markdown_text: str, title: str) -> str:
-    body = markdown_lib.markdown(markdown_text, extensions=["tables", "fenced_code"])
-    escaped_title = html.escape(title)
+    body = markdown_lib.markdown(markdown_text, extensions=["tables", "fenced_code"], output_format="html5")
+    report_title = html.escape(first_markdown_title(markdown_text) or title)
+    gen_time = html.escape(generated_time(markdown_text))
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>{escaped_title}</title>
+  <title>{report_title}</title>
   <style>
-    @page {{ size: A4 landscape; margin: 10mm; }}
+    @page {{ size: A4; margin: 11mm 11mm 9mm; }}
+    * {{ box-sizing: border-box; }}
     html, body {{ margin: 0; padding: 0; }}
     body {{
       font-family: "WenQuanYi Zen Hei", "WenQuanYi Micro Hei", "Noto Sans CJK SC",
         "Noto Sans CJK", "DejaVu Sans", "Microsoft YaHei", Arial, sans-serif;
-      font-size: 11px;
-      line-height: 1.52;
-      color: #17202a;
-      background: #ffffff;
+      font-size: 9.8pt;
+      line-height: 1.34;
+      color: #191919;
+      background: #fff;
     }}
-    h1 {{ font-size: 23px; margin: 0 0 12px; color: #0f172a; }}
-    h2 {{ font-size: 17px; margin: 20px 0 9px; color: #111827; page-break-after: avoid; }}
-    h3 {{ font-size: 13px; margin: 14px 0 7px; color: #1f2937; page-break-after: avoid; }}
-    h4 {{ font-size: 12px; margin: 12px 0 6px; color: #374151; page-break-after: avoid; }}
-    p, li {{ word-break: normal; overflow-wrap: anywhere; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 9px 0 15px; font-size: 8.8px; page-break-inside: auto; table-layout: fixed; }}
-    thead {{ display: table-header-group; }}
-    tr {{ page-break-inside: avoid; page-break-after: auto; }}
-    th, td {{ border: 1px solid #d8dee9; padding: 4px 5px; vertical-align: top; overflow-wrap: anywhere; word-break: normal; }}
-    th {{ background: #f3f6f9; font-weight: 700; }}
-    th:nth-child(1), td:nth-child(1) {{ width: 15%; }}
-    th:nth-child(2), td:nth-child(2) {{ width: 12%; }}
-    th:nth-child(3), td:nth-child(3),
-    th:nth-child(4), td:nth-child(4),
-    th:nth-child(5), td:nth-child(5),
-    th:nth-child(6), td:nth-child(6) {{ width: 7%; white-space: nowrap; text-align: right; }}
-    th:nth-child(7), td:nth-child(7) {{ width: 12%; }}
-    th:nth-child(8), td:nth-child(8) {{ width: 29%; }}
-    code, pre {{ white-space: pre-wrap; word-break: break-word; }}
-    a {{ color: #1d4ed8; text-decoration: none; }}
+    .topbar {{
+      display: grid;
+      grid-template-columns: 1fr 1.6fr 1fr;
+      align-items: end;
+      gap: 8px;
+      border-bottom: 1px solid #9b1c1f;
+      padding-bottom: 5px;
+      margin-bottom: 8px;
+      color: #4b5563;
+      font-size: 8.5pt;
+    }}
+    .topbar .title {{ text-align: center; color: #111827; font-size: 18pt; font-weight: 700; }}
+    .topbar .right {{ text-align: right; }}
+    .content h1 {{ display: none; }}
+    .content h2 {{
+      color: #b91c1c;
+      font-size: 13.5pt;
+      margin: 10px 0 5px;
+      padding: 0 0 2px;
+      border-bottom: 1px solid #e5e7eb;
+      page-break-after: avoid;
+    }}
+    .content h3 {{ color: #111827; font-size: 10.5pt; margin: 8px 0 4px; font-weight: 700; page-break-after: avoid; }}
+    .content h4 {{ color: #111827; font-size: 9.5pt; margin: 7px 0 4px; font-weight: 700; page-break-after: avoid; }}
+    p {{ margin: 4px 0 6px; }}
+    ol, ul {{ margin: 4px 0 7px 18px; padding: 0; }}
+    li {{ margin: 2px 0; }}
+    table {{
+      border-collapse: collapse;
+      width: 100%;
+      margin: 5px 0 8px;
+      font-size: 8.5pt;
+      table-layout: fixed;
+      page-break-inside: avoid;
+    }}
+    th, td {{
+      border: 1px solid #d1d5db;
+      padding: 3.5px 4px;
+      vertical-align: top;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+    }}
+    th {{ background: #f3f4f6; color: #111827; font-weight: 700; }}
+    table:nth-of-type(1) th, table:nth-of-type(1) td {{ text-align: center; }}
+    td:nth-child(2), td:nth-child(3) {{ white-space: normal; }}
+    .footnote, .content > p:last-child {{ color: #6b7280; font-size: 7.6pt; border-top: 1px solid #e5e7eb; padding-top: 4px; }}
+    a {{ color: #111827; text-decoration: none; }}
   </style>
 </head>
 <body>
-{body}
+  <div class="topbar">
+    <div>{gen_time}</div>
+    <div class="title">{report_title}</div>
+    <div class="right">AI投研 · 美股版</div>
+  </div>
+  <div class="content">{body}</div>
 </body>
 </html>
 """
@@ -175,11 +228,11 @@ def render_pdf_with_wkhtmltopdf(html_path: Path, pdf_path: Path, config: dict[st
         "--enable-local-file-access",
         "--print-media-type",
         "--page-size", "A4",
-        "--orientation", "Landscape",
-        "--margin-top", "10mm",
-        "--margin-bottom", "10mm",
-        "--margin-left", "10mm",
-        "--margin-right", "10mm",
+        "--orientation", "Portrait",
+        "--margin-top", "11mm",
+        "--margin-bottom", "9mm",
+        "--margin-left", "11mm",
+        "--margin-right", "11mm",
         str(html_path.resolve()),
         str(pdf_path.resolve()),
     ]
@@ -200,7 +253,7 @@ def render_pdf_with_playwright(html_path: Path, pdf_path: Path) -> tuple[bool, s
             browser = playwright.chromium.launch(args=["--no-sandbox"])
             page = browser.new_page()
             page.goto(html_path.resolve().as_uri(), wait_until="networkidle")
-            page.pdf(path=str(pdf_path.resolve()), format="A4", landscape=True, print_background=True, margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"})
+            page.pdf(path=str(pdf_path.resolve()), format="A4", landscape=False, print_background=True, margin={"top": "11mm", "bottom": "9mm", "left": "11mm", "right": "11mm"})
             browser.close()
         return True, "Playwright/Chromium 转换完成"
     except Exception as exc:  # noqa: BLE001
@@ -235,7 +288,7 @@ def write_outputs(config: dict[str, Any], markdown_text: str) -> tuple[Path, Pat
     pdf_path = pdf_dir / f"{base_name}.pdf"
     warnings: list[str] = []
     markdown_path.write_text(markdown_text, encoding="utf-8")
-    html_path.write_text(markdown_to_html(markdown_text, config.get("report", {}).get("title", base_name)), encoding="utf-8")
+    html_path.write_text(markdown_to_html(markdown_text, first_markdown_title(markdown_text)), encoding="utf-8")
     if config.get("report", {}).get("pdf", {}).get("enabled", True):
         warning = render_pdf_from_html(html_path, pdf_path, config)
         if warning:
@@ -246,9 +299,29 @@ def write_outputs(config: dict[str, Any], markdown_text: str) -> tuple[Path, Pat
     return markdown_path, pdf_path, warnings
 
 
+def latest_market_data_path(config: dict[str, Any]) -> Path:
+    return Path(config.get("market", {}).get("latest_data_path", "data/processed/latest_market_data.json"))
+
+
+def load_or_fetch_market_data(config: dict[str, Any], logger: logging.Logger) -> dict[str, Any]:
+    path = latest_market_data_path(config)
+    max_age_minutes = int(config.get("market", {}).get("latest_snapshot_max_age_minutes", 720))
+    if path.exists():
+        age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
+        if age <= timedelta(minutes=max_age_minutes):
+            try:
+                logger.info("读取已刷新行情快照: %s", path)
+                return json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                logger.warning("行情快照 JSON 解析失败，将重新刷新: %s", path)
+    logger.info("未找到可用行情快照，render_report 将临时刷新行情。")
+    config.setdefault("market", {})["prefer_cache"] = False
+    return fetch_market_data(config)
+
+
 def market_fetch_summary(market_data: dict[str, Any]) -> str:
     metadata = market_data.get("metadata", {})
-    return f"完整池行情成功 {metadata.get('success_count', 0)}/{metadata.get('total_count', 0)}，实时 {metadata.get('live_success_count', 0)}，缓存 {metadata.get('cache_success_count', 0)}，失败 {metadata.get('failed_count', 0)}"
+    return f"行情成功 {metadata.get('success_count', 0)}/{metadata.get('total_count', 0)}，实时 {metadata.get('live_success_count', 0)}，缓存 {metadata.get('cache_success_count', 0)}，失败 {metadata.get('failed_count', 0)}"
 
 
 def news_fetch_summary(news_data: dict[str, Any]) -> str:
@@ -359,8 +432,7 @@ def enforce_realtime_and_cache_quality(config: dict[str, Any], market_data: dict
     cache_success = int(metadata.get("cache_success_count") or 0)
     blockers: list[str] = []
     if total <= 0:
-        blockers.append("live_data_unavailable: total_count=0")
-        return blockers
+        return ["live_data_unavailable: total_count=0"]
     live_ratio = live_success / total
     cache_ratio = cache_success / total
     if live_success == 0:
@@ -453,46 +525,39 @@ def market_failure_status_message(market_data: dict[str, Any]) -> str:
     success_ratio = float(metadata.get("success_ratio") or 0.0) * 100
     live_ratio = live_success / total * 100 if total else 0.0
     cache_ratio = cache_success / total * 100 if total else 0.0
-    min_ratio = float(metadata.get("min_success_ratio") or 0.9) * 100
-    timed_out = bool(metadata.get("market_fetch_timed_out"))
-    needs_upgrade = bool(metadata.get("needs_data_source_upgrade"))
     lines = [
         market_failure_headline(market_data),
         f"行情成功数量: {success}/{total}",
         f"行情失败数量: {failed}",
-        f"行情成功率: {success_ratio:.1f}%（正式报告门槛 {min_ratio:.1f}%）",
+        f"行情成功率: {success_ratio:.1f}%",
         f"实时获取数量: {live_success}（实时占比 {live_ratio:.1f}%）",
-        f"缓存降级数量: {cache_success}（缓存占比 {cache_ratio:.1f}%）",
-        f"失败 ticker: {compact_failed_details(metadata.get('failed_details', []))}",
-        f"缓存 ticker 和日期: {compact_list(cache_ticker_details(market_data), limit=80)}",
-        f"缓存日期集合: {compact_list(cache_dates(market_data))}",
-        f"阻断原因: {compact_list(metadata.get('quality_blockers', []), limit=80)}",
+        f"缓存命中数量: {cache_success}（缓存占比 {cache_ratio:.1f}%）",
+        f"失败 ticker: {compact_failed_details(metadata.get('failed_details', []), limit=80)}",
+        f"缓存 ticker 和日期: {compact_list(cache_ticker_details(market_data), limit=120)}",
+        f"阻断原因: {compact_list(metadata.get('quality_blockers', []), limit=120)}",
         f"数据源: {metadata.get('source') or '未披露'}",
         f"获取时间: {metadata.get('fetched_at') or '未披露'}",
-        f"成功 ticker: {compact_list(metadata.get('success_tickers', []), limit=80)}",
+        f"成功 ticker: {compact_list(metadata.get('success_tickers', []), limit=120)}",
         f"关键分组: {critical_group_text(metadata.get('critical_groups', {}))}",
     ]
     if metadata.get("macro_degraded"):
         lines.append(f"宏观降级: {metadata.get('macro_degraded_message')} 缺失 {compact_list(metadata.get('macro_degraded_tickers', []))}")
-    if timed_out:
+    if metadata.get("market_fetch_timed_out"):
         lines.extend([
             f"未完成 ticker: {compact_list(metadata.get('unfinished_tickers', []))}",
             f"当前 provider: {metadata.get('current_provider') or '未披露'}",
             f"当前 ticker: {metadata.get('current_ticker') or '未披露'}",
             f"失败原因: {metadata.get('last_error') or 'market_fetch_timeout'}",
         ])
-    lines.append(f"是否需要升级/接入正式数据源: {'是' if needs_upgrade else '否'}")
-    if needs_upgrade:
+    lines.append(f"是否需要升级/接入正式数据源: {'是' if metadata.get('needs_data_source_upgrade') else '否'}")
+    if metadata.get("needs_data_source_upgrade"):
         lines.append(metadata.get("upgrade_message") or "免费行情源无法满足完整报告，需要接入/升级正式数据源。")
     lines.extend([
         "建议动作:",
         "1. 等待下一次自动运行，避免在数据源限流时反复触发。",
-        "2. 手动运行 python -m src.warm_market_cache --config config.yaml 预热缓存。",
+        "2. 手动运行 python -m src.refresh_market_data --config config.yaml 刷新最新行情。",
         "3. 接入或升级 Finnhub / FMP / Twelve Data 等正式行情源。",
     ])
-    quote_only = metadata.get("quote_only_tickers", [])
-    if quote_only:
-        lines.append(f"quote 成功但历史指标暂缺: {compact_list(quote_only)}")
     return "\n".join(lines)
 
 
@@ -521,6 +586,10 @@ def validate_report_text(markdown_text: str) -> str | None:
     for term in FORBIDDEN_REPORT_TERMS:
         if term.lower() in lower_text:
             return f"正式报告包含禁止内容: {term}"
+    required = ["一、美股指数概况", "二、宏观与地缘", "三、行业与ETF结构", "四、美股科技股跟踪", "五、AH盘前参考", "4.4 重要信息 / AI产业催化", "Update Matrix", "最终判断"]
+    for term in required:
+        if term not in markdown_text:
+            return f"正式报告缺少 Golden Sample 固定栏目: {term}"
     return None
 
 
@@ -529,33 +598,18 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
     logger.info("开始时间: %s", datetime.now().astimezone().isoformat(timespec="seconds"))
     config = load_config(config_path)
     logger.info("配置文件: %s", config_path)
-    market_data = fetch_market_data(config)
+    market_data = load_or_fetch_market_data(config, logger)
     apply_quality_gates(config, market_data, logger)
     metadata = market_data.get("metadata", {})
     logger.info("数据获取结果: %s", market_fetch_summary(market_data))
-    logger.info("缓存降级ticker: %s", compact_list(cache_ticker_details(market_data), limit=200))
+    logger.info("缓存ticker: %s", compact_list(cache_ticker_details(market_data), limit=200))
     logger.info("缓存日期集合: %s", compact_list(cache_dates(market_data), limit=200))
     logger.info("质量阻断: %s", compact_list(metadata.get("quality_blockers", []), limit=200))
     logger.info("行情成功ticker: %s", compact_list(metadata.get("success_tickers", []), limit=200))
     logger.info("行情失败ticker: %s", compact_failed_details(metadata.get("failed_details", []), limit=200))
-    logger.info("quote成功ticker: %s", compact_list(metadata.get("quote_success_tickers", []), limit=200))
-    logger.info("historical成功ticker: %s", compact_list(metadata.get("historical_success_tickers", []), limit=200))
     logger.info("关键分组: %s", critical_group_text(metadata.get("critical_groups", {})))
-    if metadata.get("market_fetch_timed_out"):
-        logger.error("失败原因: market_fetch_timeout provider=%s ticker=%s last_error=%s", metadata.get("current_provider"), metadata.get("current_ticker"), metadata.get("last_error"))
     for warning in metadata.get("warnings", []):
         logger.warning("行情/质量警告: %s", warning)
-    for asset in market_data.get("assets", []):
-        source = asset.get("source", {}) if isinstance(asset.get("source"), dict) else {}
-        logger.info(
-            "行情明细: ticker=%s from_cache=%s provider=%s as_of=%s company=%s exchange=%s currency=%s failure_reason=%s",
-            asset.get("ticker"), asset.get("from_cache"), source.get("provider"), asset.get("as_of") or source.get("as_of"),
-            source.get("company_name"), source.get("exchange"), source.get("currency"), asset.get("failure_reason"),
-        )
-        if asset.get("error"):
-            logger.warning("行情失败或降级: ticker=%s from_cache=%s provider=%s failure_reason=%s reason=%s", asset.get("ticker"), asset.get("from_cache"), source.get("provider"), asset.get("failure_reason"), asset.get("error"))
-        elif asset.get("indicator_reason"):
-            logger.info("行情quote可用但指标暂缺: ticker=%s provider=%s reason=%s", asset.get("ticker"), source.get("provider"), asset.get("indicator_reason"))
 
     if not formal_report_allowed(market_data):
         message = market_failure_status_message(market_data)
