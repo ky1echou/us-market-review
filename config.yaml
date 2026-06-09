@@ -8,16 +8,15 @@ app:
 
 market:
   # 完整报告不做核心版/简版。数据源按顺序补齐完整股票池。
+  # Stooq 默认不进入生产链；如需手动测试，可把 provider_options.stooq.enabled 改为 true 或设置 ENABLE_STOOQ=true。
   market_data_provider_order:
     - fmp
     - twelve_data
-    - stooq
     - yfinance
     - cache
   provider_chain:
     - fmp
     - twelve_data
-    - stooq
     - yfinance
     - cache
 
@@ -26,7 +25,7 @@ market:
       api_key_env: FMP_API_KEY
       base_url: https://financialmodelingprep.com/stable
       quote_batch_size: 80
-      timeout: 20
+      timeout: 12
       symbol_map:
         SPY: SPY
         QQQ: QQQ
@@ -63,21 +62,15 @@ market:
     twelve_data:
       api_key_env: TWELVE_DATA_API_KEY
       base_url: https://api.twelvedata.com
-      timeout: 20
+      timeout: 12
       symbol_map:
         VIX: VIX
         US10Y: TNX
         DXY: DXY
         BTCUSD: BTC/USD
     stooq:
+      enabled: false
       symbol_map:
-        ^GSPC: spy.us
-        ^IXIC: qqq.us
-        ^DJI: dia.us
-        ^RUT: iwm.us
-        ^SOX: smh.us
-        ^VIX: ^vix
-        ^TNX: 10usy.b
         SPY: spy.us
         QQQ: qqq.us
         DIA: dia.us
@@ -124,16 +117,20 @@ market:
   period: 90d
   provider_check_period: 30d
   interval: 1d
-
-  # 完整池请求允许更长等待，避免免费源短时限流导致误判。
   request_delay_sec: 0.5
   retry_count: 3
   retry_backoff_sec: 30.0
+  provider_request_timeout_sec: 12
+  per_ticker_timeout_sec: 60
+  market_fetch_timeout_sec: 1200
+  twelve_data_batch_size: 3
+  twelve_data_batch_sleep_sec: 90
+  twelve_data_retry_sleep_sec: 90
 
   cache_dir: data/processed/market_cache
   cache_snapshot_path: data/processed/market_cache.json
   cache_max_age_hours: 168
-  cache_max_trading_days: 5
+  cache_max_trading_days: 3
 
   # 完整股票池可用率低于 90%，不生成正式 Markdown/PDF，只推送状态提示。
   min_success_ratio: 0.9
@@ -149,129 +146,44 @@ market:
       tickers: [AMD, AVGO, MU, MRVL, ARM]
 
   benchmarks:
-    - ticker: SPY
-      name: 标普500ETF
-      required: true
-    - ticker: QQQ
-      name: 纳斯达克100ETF
-      required: true
-    - ticker: DIA
-      name: 道琼斯ETF
-      required: true
-    - ticker: IWM
-      name: 罗素2000ETF
-      required: true
-    - ticker: SMH
-      name: 费城半导体/半导体ETF
-      required: true
-    - ticker: SOXX
-      name: 半导体ETF
-      required: true
-    - ticker: VIX
-      name: VIX波动率指数
-      required: true
+    - {ticker: SPY, name: 标普500ETF, required: true}
+    - {ticker: QQQ, name: 纳斯达克100ETF, required: true}
+    - {ticker: DIA, name: 道琼斯ETF, required: true}
+    - {ticker: IWM, name: 罗素2000ETF, required: true}
+    - {ticker: SMH, name: 费城半导体/半导体ETF, required: true}
+    - {ticker: SOXX, name: 半导体ETF, required: true}
+    - {ticker: VIX, name: VIX波动率指数, required: true}
 
   sector_etfs:
-    - ticker: XLK
-      name: 科技ETF
-      required: true
-    - ticker: XLF
-      name: 金融ETF
-      required: true
-    - ticker: XLE
-      name: 能源ETF
-      required: true
-    - ticker: XLV
-      name: 医疗ETF
-      required: true
+    - {ticker: XLK, name: 科技ETF, required: true}
+    - {ticker: XLF, name: 金融ETF, required: true}
+    - {ticker: XLE, name: 能源ETF, required: true}
+    - {ticker: XLV, name: 医疗ETF, required: true}
 
   key_stocks:
-    - ticker: NVDA
-      name: 英伟达
-      theme: AI算力
-      required: true
-    - ticker: MSFT
-      name: 微软
-      theme: 云与AI应用
-      required: true
-    - ticker: AAPL
-      name: 苹果
-      theme: 科技龙头/端侧AI
-      required: true
-    - ticker: AMZN
-      name: 亚马逊
-      theme: 云计算/消费
-      required: true
-    - ticker: GOOGL
-      name: Alphabet
-      theme: AI应用/云
-      required: true
-    - ticker: META
-      name: Meta
-      theme: AI广告/大模型
-      required: true
-    - ticker: TSLA
-      name: 特斯拉
-      theme: 电动车/机器人/自动驾驶
-      required: true
-    - ticker: AMD
-      name: AMD
-      theme: AI芯片
-      required: true
-    - ticker: AVGO
-      name: 博通
-      theme: AI网络/ASIC
-      required: true
-    - ticker: MU
-      name: 美光
-      theme: AI存储/HBM
-      required: true
-    - ticker: MRVL
-      name: Marvell
-      theme: AI网络/ASIC
-      required: true
-    - ticker: ARM
-      name: Arm
-      theme: AI芯片IP
-      required: true
-    - ticker: SNOW
-      name: Snowflake
-      theme: AI数据云
-      required: true
-    - ticker: NOW
-      name: ServiceNow
-      theme: AI软件/SaaS
-      required: true
+    - {ticker: NVDA, name: 英伟达, theme: AI算力, required: true}
+    - {ticker: MSFT, name: 微软, theme: 云与AI应用, required: true}
+    - {ticker: AAPL, name: 苹果, theme: 科技龙头/端侧AI, required: true}
+    - {ticker: AMZN, name: 亚马逊, theme: 云计算/消费, required: true}
+    - {ticker: GOOGL, name: Alphabet, theme: AI应用/云, required: true}
+    - {ticker: META, name: Meta, theme: AI广告/大模型, required: true}
+    - {ticker: TSLA, name: 特斯拉, theme: 电动车/机器人/自动驾驶, required: true}
+    - {ticker: AMD, name: AMD, theme: AI芯片, required: true}
+    - {ticker: AVGO, name: 博通, theme: AI网络/ASIC, required: true}
+    - {ticker: MU, name: 美光, theme: AI存储/HBM, required: true}
+    - {ticker: MRVL, name: Marvell, theme: AI网络/ASIC, required: true}
+    - {ticker: ARM, name: Arm, theme: AI芯片IP, required: true}
+    - {ticker: SNOW, name: Snowflake, theme: AI数据云, required: true}
+    - {ticker: NOW, name: ServiceNow, theme: AI软件/SaaS, required: true}
 
   macro_assets:
-    - ticker: US10Y
-      name: 10Y美债收益率
-      theme: 利率
-      required: true
-    - ticker: DXY
-      name: 美元指数
-      theme: 美元
-      required: true
-    - ticker: TLT
-      name: 长债ETF
-      theme: 利率/久期
-      required: true
-    - ticker: GLD
-      name: 黄金ETF
-      theme: 黄金
-      required: true
-    - ticker: USO
-      name: 原油ETF
-      theme: 原油
-      required: true
-    - ticker: CPER
-      name: 铜ETF
-      theme: 铜
-      required: true
-    - ticker: BTCUSD
-      name: 比特币
-      theme: 风险资产
-      required: true
+    - {ticker: US10Y, name: 10Y美债收益率, theme: 利率, required: true}
+    - {ticker: DXY, name: 美元指数, theme: 美元, required: true}
+    - {ticker: TLT, name: 长债ETF, theme: 利率/久期, required: true}
+    - {ticker: GLD, name: 黄金ETF, theme: 黄金, required: true}
+    - {ticker: USO, name: 原油ETF, theme: 原油, required: true}
+    - {ticker: CPER, name: 铜ETF, theme: 铜, required: true}
+    - {ticker: BTCUSD, name: 比特币, theme: 风险资产, required: true}
 
 news:
   lookback_hours: 36
