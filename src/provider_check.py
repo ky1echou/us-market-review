@@ -29,8 +29,8 @@ DEFAULT_FORMAL_TICKERS = [
     "VIX", "US10Y", "DXY", "CPER", "BTCUSD", "NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA",
     "AMD", "AVGO", "MU", "MRVL", "ARM", "SNOW", "NOW",
 ]
-LIVE_PROVIDERS = ["fmp", "twelve_data", "stooq", "yfinance"]
-ALL_PROVIDERS = ["fmp", "twelve_data", "stooq", "yfinance", "cache"]
+LIVE_PROVIDERS = ["fmp", "finnhub", "twelve_data", "stooq", "yfinance"]
+ALL_PROVIDERS = ["fmp", "finnhub", "twelve_data", "stooq", "yfinance", "cache"]
 HISTORICAL_SAMPLE = ["AAPL", "MSFT", "NVDA"]
 ALLOWED_FAILURE_REASONS = {
     "missing_api_key", "invalid_api_key", "payment_required", "provider_permission_denied", "quote_failed", "historical_failed",
@@ -84,7 +84,7 @@ def parse_tickers(value: str | None) -> list[str]:
 
 def normalize_provider_name(provider: str) -> str:
     normalized = provider.strip().lower()
-    aliases = {"financial_modeling_prep": "fmp", "financialmodelingprep": "fmp", "twelvedata": "twelve_data", "twelve": "twelve_data", "local_cache": "cache", "local market cache": "cache"}
+    aliases = {"financial_modeling_prep": "fmp", "financialmodelingprep": "fmp", "finn_hub": "finnhub", "twelvedata": "twelve_data", "twelve": "twelve_data", "local_cache": "cache", "local market cache": "cache"}
     return aliases.get(normalized, normalized)
 
 
@@ -94,7 +94,7 @@ def providers_to_check(provider: str) -> list[str]:
         return ALL_PROVIDERS.copy()
     if normalized in ALL_PROVIDERS:
         return [normalized]
-    raise ValueError("--provider must be one of: all, fmp, twelve_data, stooq, yfinance, cache")
+    raise ValueError("--provider must be one of: all, fmp, finnhub, twelve_data, stooq, yfinance, cache")
 
 
 def provider_enabled(provider_name: str, provider_options: dict[str, Any]) -> bool:
@@ -106,10 +106,9 @@ def disabled_reason(provider_name: str, provider_options: dict[str, Any]) -> tup
     options = provider_options_for(provider_options, provider_name)
     if options.get("enabled") is False or (provider_name == "stooq" and not provider_option_enabled(provider_name, options)):
         return "provider disabled by config", "provider_disabled"
-    if provider_name == "fmp":
-        return "FMP_API_KEY is not configured", "missing_api_key"
-    if provider_name == "twelve_data":
-        return "TWELVE_DATA_API_KEY is not configured", "missing_api_key"
+    env_names = {"fmp": "FMP_API_KEY", "finnhub": "FINNHUB_API_KEY", "twelve_data": "TWELVE_DATA_API_KEY"}
+    if provider_name in env_names:
+        return f"{env_names[provider_name]} is not configured", "missing_api_key"
     return "provider is disabled", "quote_failed"
 
 
@@ -119,18 +118,14 @@ def disabled_provider_result(provider_name: str, tickers: list[str], provider_op
     return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": False, "success_count": 0, "failed_count": len(tickers), "items": rows}
 
 
-def api_key_metadata(provider: Any, provider_name: str) -> dict[str, Any]:
+def api_key_metadata(provider: Any) -> dict[str, Any]:
     metadata = getattr(provider, "api_key_metadata", None)
     if callable(metadata):
         return metadata()
-    if provider_name == "twelve_data":
-        raw = str(getattr(provider, "api_key_raw", "") or "")
-        trimmed = str(getattr(provider, "api_key", "") or "")
-        return {"env_name": "TWELVE_DATA_API_KEY", "exists": bool(trimmed), "length": len(raw), "trimmed_length": len(trimmed), "has_outer_whitespace": raw != raw.strip(), "loaded_from_dotenv": Path(".env").exists()}
     return {}
 
 
-def provider_quote_check(provider: Any, provider_name: str, ticker: str, period: str, interval: str, timeout_sec: int) -> tuple[bool, bool, int, str, str]:
+def provider_quote_check(provider: Any, ticker: str, period: str, interval: str, timeout_sec: int) -> tuple[bool, bool, int, str, str]:
     fetch_quote = getattr(provider, "fetch_quote", None)
     if callable(fetch_quote):
         try:
@@ -161,7 +156,8 @@ def check_dry_provider(provider_name: str, tickers: list[str], provider_options:
     rows: list[dict[str, Any]] = []
     for ticker in tickers:
         symbol = str(cache_path(cache_dir, ticker, period, interval)) if provider_name == "cache" else resolve_provider_symbol(provider_name, ticker, provider_options_for(provider_options, provider_name))
-        rows.append({"ticker": ticker, "symbol": symbol, "status": "mapped" if enabled else "disabled", "rows": 0, "latest": "", "reason": "" if enabled else disabled_reason(provider_name, provider_options)[0], "failure_category": "" if enabled else disabled_reason(provider_name, provider_options)[1], "quote_parse_success": enabled, "historical_parse_success": False, "historical_failure_category": ""})
+        reason, category = disabled_reason(provider_name, provider_options) if not enabled else ("", "")
+        rows.append({"ticker": ticker, "symbol": symbol, "status": "mapped" if enabled else "disabled", "rows": 0, "latest": "", "reason": reason, "failure_category": category, "quote_parse_success": enabled, "historical_parse_success": False, "historical_failure_category": ""})
     return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": enabled, "dry_run": True, "success_count": len(tickers) if enabled else 0, "failed_count": 0 if enabled else len(tickers), "items": rows}
 
 
@@ -183,14 +179,14 @@ def check_live_provider(provider_name: str, tickers: list[str], period: str, int
         if index > 0 and request_delay_sec > 0:
             time.sleep(request_delay_sec)
         symbol = resolve_provider_symbol(provider_name, ticker, options)
-        quote_ok, historical_ok, row_count, reason, category = provider_quote_check(provider, provider_name, ticker, period, interval, timeout_sec)
+        quote_ok, historical_ok, row_count, reason, category = provider_quote_check(provider, ticker, period, interval, timeout_sec)
         if quote_ok:
             success += 1
             rows.append({"ticker": ticker, "symbol": symbol, "status": "ok", "rows": row_count, "latest": "", "reason": "", "failure_category": "", "quote_parse_success": True, "historical_parse_success": historical_ok, "historical_failure_category": "" if historical_ok or ticker not in HISTORICAL_SAMPLE else "historical_failed"})
         else:
             failed += 1
             rows.append({"ticker": ticker, "symbol": symbol, "status": "failed", "rows": 0, "latest": "", "reason": reason or category, "failure_category": category or "quote_failed", "quote_parse_success": False, "historical_parse_success": False, "historical_failure_category": ""})
-    return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": True, "api_key": api_key_metadata(provider, provider_name), "success_count": success, "failed_count": failed, "items": rows}
+    return {"provider": provider_display_name(provider_name), "provider_key": provider_name, "enabled": True, "api_key": api_key_metadata(provider), "success_count": success, "failed_count": failed, "items": rows}
 
 
 def check_cache_provider(tickers: list[str], period: str, interval: str, cache_dir: str, cache_max_age_hours: int, cache_max_trading_days: int) -> dict[str, Any]:
@@ -257,7 +253,7 @@ def render_text(results: list[dict[str, Any]], coverage: dict[str, Any], generat
         quote_success = [str(item["ticker"]) for item in items if item.get("quote_parse_success")]
         historical_success = [str(item["ticker"]) for item in items if item.get("historical_parse_success")]
         api_key = result.get("api_key") or {}
-        if result.get("provider_key") in {"fmp", "twelve_data"} and api_key:
+        if result.get("provider_key") in {"fmp", "finnhub", "twelve_data"} and api_key:
             lines.append(f"{api_key.get('env_name')} exists={'yes' if api_key.get('exists') else 'no'} length={api_key.get('length', 0)} trimmed_length={api_key.get('trimmed_length', 0)} outer_whitespace={'yes' if api_key.get('has_outer_whitespace') else 'no'} loaded_from_dotenv={'yes' if api_key.get('loaded_from_dotenv') else 'no'}")
         lines.append(f"provider={result['provider']} enabled={str(result.get('enabled', True)).lower()} success={result['success_count']} failed={result['failed_count']}")
         lines.append(f"success_tickers={','.join(success_tickers)}")
@@ -293,7 +289,7 @@ def fmp_result_failed(results: list[dict[str, Any]], selected_providers: list[st
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check market data providers against the formal report ticker universe.")
-    parser.add_argument("--provider", default="all", help="all, fmp, twelve_data, stooq, yfinance, or cache")
+    parser.add_argument("--provider", default="all", help="all, fmp, finnhub, twelve_data, stooq, yfinance, or cache")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--tickers", default="", help="Optional comma-separated ticker list. Defaults to the formal report universe in config.yaml.")
     parser.add_argument("--symbols", default="", help="Alias for --tickers, useful for provider symbol diagnostics.")
