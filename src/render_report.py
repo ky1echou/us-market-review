@@ -23,7 +23,18 @@ from .symbol_validation import validate_market_symbols
 
 MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。"
 MARKET_TIMEOUT_MESSAGE = "us-market-review 运行超时，未生成正式美股复盘，请检查数据源。"
+CACHE_ONLY_FAILURE_MESSAGE = "今日行情源异常，本次仅命中缓存，未生成正式美股复盘。"
 REPORT_QUALITY_FAILURE_MESSAGE = "正式报告生成质量校验失败，未发送报告文件，请检查 logs/daily.log。"
+LIVE_MIN_SUCCESS_RATIO = 0.70
+CACHE_MAX_SUCCESS_RATIO = 0.30
+KEY_TICKERS_FOR_FRESH_CACHE = [
+    "SPY", "QQQ", "DIA", "IWM", "SMH", "SOXX", "VIX",
+    "NVDA", "MSFT", "AAPL", "AMZN", "GOOGL", "META", "TSLA",
+    "AMD", "AVGO", "MU", "MRVL", "ARM",
+    "US10Y", "DXY", "TLT", "GLD", "USO", "BTCUSD",
+]
+MACRO_DEGRADE_TICKERS = ["US10Y", "DXY"]
+MACRO_BLOCK_TICKERS = ["US10Y", "DXY", "TLT"]
 FORBIDDEN_REPORT_TERMS = [
     "Too Many Requests",
     "HTTP 402",
@@ -107,8 +118,9 @@ def markdown_to_html(markdown_text: str, title: str) -> str:
     h1 {{ font-size: 23px; margin: 0 0 12px; color: #0f172a; }}
     h2 {{ font-size: 17px; margin: 20px 0 9px; color: #111827; page-break-after: avoid; }}
     h3 {{ font-size: 13px; margin: 14px 0 7px; color: #1f2937; page-break-after: avoid; }}
+    h4 {{ font-size: 12px; margin: 12px 0 6px; color: #374151; page-break-after: avoid; }}
     p, li {{ word-break: normal; overflow-wrap: anywhere; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 9px 0 15px; font-size: 9px; page-break-inside: auto; table-layout: fixed; }}
+    table {{ border-collapse: collapse; width: 100%; margin: 9px 0 15px; font-size: 8.8px; page-break-inside: auto; table-layout: fixed; }}
     thead {{ display: table-header-group; }}
     tr {{ page-break-inside: avoid; page-break-after: auto; }}
     th, td {{ border: 1px solid #d8dee9; padding: 4px 5px; vertical-align: top; overflow-wrap: anywhere; word-break: normal; }}
@@ -119,8 +131,8 @@ def markdown_to_html(markdown_text: str, title: str) -> str:
     th:nth-child(4), td:nth-child(4),
     th:nth-child(5), td:nth-child(5),
     th:nth-child(6), td:nth-child(6) {{ width: 7%; white-space: nowrap; text-align: right; }}
-    th:nth-child(7), td:nth-child(7) {{ width: 11%; }}
-    th:nth-child(8), td:nth-child(8) {{ width: 28%; }}
+    th:nth-child(7), td:nth-child(7) {{ width: 12%; }}
+    th:nth-child(8), td:nth-child(8) {{ width: 29%; }}
     code, pre {{ white-space: pre-wrap; word-break: break-word; }}
     a {{ color: #1d4ed8; text-decoration: none; }}
   </style>
@@ -289,6 +301,14 @@ def critical_group_text(groups: dict[str, Any]) -> str:
     return "；".join(parts)
 
 
+def asset_is_usable(asset: dict[str, Any] | None) -> bool:
+    return bool(asset and (asset.get("last_close") is not None or asset.get("quote_success")))
+
+
+def asset_lookup(market_data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(asset.get("ticker", "")).upper(): asset for asset in market_data.get("assets", [])}
+
+
 def cache_ticker_details(market_data: dict[str, Any]) -> list[str]:
     details = []
     for asset in market_data.get("assets", []):
@@ -307,6 +327,16 @@ def parse_asset_date(value: Any):
         return None
 
 
+def cache_dates(market_data: dict[str, Any]) -> list[str]:
+    dates: list[str] = []
+    for asset in market_data.get("assets", []):
+        source = asset.get("source", {}) if isinstance(asset.get("source"), dict) else {}
+        if asset.get("from_cache") or source.get("from_cache"):
+            value = asset.get("as_of") or source.get("as_of")
+            dates.append(str(value or "unknown")[:10])
+    return sorted(set(dates))
+
+
 def enforce_cache_freshness(market_data: dict[str, Any], max_trading_days: int = 3) -> list[str]:
     blockers: list[str] = []
     for asset in market_data.get("assets", []):
@@ -319,6 +349,67 @@ def enforce_cache_freshness(market_data: dict[str, Any], max_trading_days: int =
     return blockers
 
 
+def enforce_realtime_and_cache_quality(config: dict[str, Any], market_data: dict[str, Any]) -> list[str]:
+    market_config = config.get("market", {})
+    live_min_ratio = float(market_config.get("live_min_success_ratio", LIVE_MIN_SUCCESS_RATIO))
+    cache_max_ratio = float(market_config.get("cache_max_success_ratio", CACHE_MAX_SUCCESS_RATIO))
+    metadata = market_data.get("metadata", {})
+    total = int(metadata.get("total_count") or 0)
+    live_success = int(metadata.get("live_success_count") or 0)
+    cache_success = int(metadata.get("cache_success_count") or 0)
+    blockers: list[str] = []
+    if total <= 0:
+        blockers.append("live_data_unavailable: total_count=0")
+        return blockers
+    live_ratio = live_success / total
+    cache_ratio = cache_success / total
+    if live_success == 0:
+        blockers.append("live_data_zero: 今日行情源异常，本次仅命中缓存")
+    if live_ratio < live_min_ratio:
+        blockers.append(f"live_data_insufficient: live={live_success}/{total} threshold={live_min_ratio:.0%}")
+    if cache_ratio > cache_max_ratio:
+        blockers.append(f"cache_ratio_too_high: cache={cache_success}/{total} threshold={cache_max_ratio:.0%}")
+    dates = cache_dates(market_data)
+    if len(dates) > 1:
+        blockers.append(f"cache_date_mismatch: {', '.join(dates)}")
+    lookup = asset_lookup(market_data)
+    for ticker in KEY_TICKERS_FOR_FRESH_CACHE:
+        asset = lookup.get(ticker)
+        if not asset:
+            continue
+        source = asset.get("source", {}) if isinstance(asset.get("source"), dict) else {}
+        if not (asset.get("from_cache") or source.get("from_cache")):
+            continue
+        as_of_date = parse_asset_date(asset.get("as_of") or source.get("as_of"))
+        if not as_of_date or trading_days_since(as_of_date) > 1:
+            blockers.append(f"critical_cache_stale: {ticker} as_of={asset.get('as_of') or source.get('as_of') or 'unknown'}")
+    return blockers
+
+
+def enforce_macro_quality(market_data: dict[str, Any]) -> list[str]:
+    metadata = market_data.setdefault("metadata", {})
+    lookup = asset_lookup(market_data)
+    missing_macro = [ticker for ticker in MACRO_DEGRADE_TICKERS if not asset_is_usable(lookup.get(ticker))]
+    blockers: list[str] = []
+    if missing_macro:
+        metadata["macro_degraded"] = True
+        metadata["macro_degraded_tickers"] = missing_macro
+        metadata["macro_degraded_message"] = "宏观利率/美元数据缺失，宏观判断降级。"
+        warnings = metadata.setdefault("warnings", [])
+        if metadata["macro_degraded_message"] not in warnings:
+            warnings.append(metadata["macro_degraded_message"])
+    if all(not asset_is_usable(lookup.get(ticker)) for ticker in MACRO_BLOCK_TICKERS):
+        blockers.append("macro_core_missing: US10Y,DXY,TLT all unavailable")
+    return blockers
+
+
+def add_quality_blockers(metadata: dict[str, Any], blockers: list[str]) -> None:
+    target = metadata.setdefault("quality_blockers", [])
+    for blocker in blockers:
+        if blocker not in target:
+            target.append(blocker)
+
+
 def apply_quality_gates(config: dict[str, Any], market_data: dict[str, Any], logger: logging.Logger) -> None:
     metadata = market_data.setdefault("metadata", {})
     validation = validate_market_symbols(config, market_data)
@@ -328,18 +419,28 @@ def apply_quality_gates(config: dict[str, Any], market_data: dict[str, Any], log
             item.get("ticker"), item.get("ok"), item.get("provider"), item.get("provider_symbol"),
             item.get("company_name"), item.get("exchange"), item.get("currency"), item.get("failure_reason"),
         )
-    blockers = metadata.setdefault("quality_blockers", [])
-    for blocker in enforce_cache_freshness(market_data, 3):
-        if blocker not in blockers:
-            blockers.append(blocker)
-    if blockers:
+    blockers = []
+    blockers.extend(enforce_cache_freshness(market_data, 3))
+    blockers.extend(enforce_realtime_and_cache_quality(config, market_data))
+    blockers.extend(enforce_macro_quality(market_data))
+    add_quality_blockers(metadata, blockers)
+    if metadata.get("quality_blockers"):
         metadata["formal_report_allowed"] = False
         metadata["needs_data_source_upgrade"] = True
         warnings = metadata.setdefault("warnings", [])
-        warning = "正式报告质量门槛未通过：存在过期缓存或 symbol/company_name 校验问题。"
+        warning = "正式报告质量门槛未通过：实时行情不足、缓存占比过高、缓存日期异常或关键数据缺失。"
         if warning not in warnings:
             warnings.append(warning)
-        logger.error("正式报告质量门槛未通过: %s", " | ".join(blockers))
+        logger.error("正式报告质量门槛未通过: %s", " | ".join(metadata.get("quality_blockers", [])))
+
+
+def market_failure_headline(market_data: dict[str, Any]) -> str:
+    metadata = market_data.get("metadata", {})
+    if metadata.get("market_fetch_timed_out"):
+        return MARKET_TIMEOUT_MESSAGE
+    if int(metadata.get("live_success_count") or 0) == 0 and int(metadata.get("cache_success_count") or 0) > 0:
+        return CACHE_ONLY_FAILURE_MESSAGE
+    return MARKET_FAILURE_MESSAGE
 
 
 def market_failure_status_message(market_data: dict[str, Any]) -> str:
@@ -350,26 +451,29 @@ def market_failure_status_message(market_data: dict[str, Any]) -> str:
     cache_success = int(metadata.get("cache_success_count") or 0)
     failed = int(metadata.get("failed_count") or max(total - success, 0))
     success_ratio = float(metadata.get("success_ratio") or 0.0) * 100
+    live_ratio = live_success / total * 100 if total else 0.0
+    cache_ratio = cache_success / total * 100 if total else 0.0
     min_ratio = float(metadata.get("min_success_ratio") or 0.9) * 100
     timed_out = bool(metadata.get("market_fetch_timed_out"))
     needs_upgrade = bool(metadata.get("needs_data_source_upgrade"))
     lines = [
-        MARKET_TIMEOUT_MESSAGE if timed_out else MARKET_FAILURE_MESSAGE,
+        market_failure_headline(market_data),
         f"行情成功数量: {success}/{total}",
         f"行情失败数量: {failed}",
         f"行情成功率: {success_ratio:.1f}%（正式报告门槛 {min_ratio:.1f}%）",
-        f"实时获取数量: {live_success}",
-        f"缓存降级数量: {cache_success}",
-        f"缓存降级 ticker: {compact_list(cache_ticker_details(market_data))}",
+        f"实时获取数量: {live_success}（实时占比 {live_ratio:.1f}%）",
+        f"缓存降级数量: {cache_success}（缓存占比 {cache_ratio:.1f}%）",
+        f"失败 ticker: {compact_failed_details(metadata.get('failed_details', []))}",
+        f"缓存 ticker 和日期: {compact_list(cache_ticker_details(market_data), limit=80)}",
+        f"缓存日期集合: {compact_list(cache_dates(market_data))}",
+        f"阻断原因: {compact_list(metadata.get('quality_blockers', []), limit=80)}",
         f"数据源: {metadata.get('source') or '未披露'}",
         f"获取时间: {metadata.get('fetched_at') or '未披露'}",
-        f"成功 ticker: {compact_list(metadata.get('success_tickers', []))}",
-        f"失败 ticker: {compact_failed_details(metadata.get('failed_details', []))}",
-        f"质量阻断: {compact_list(metadata.get('quality_blockers', []))}",
+        f"成功 ticker: {compact_list(metadata.get('success_tickers', []), limit=80)}",
         f"关键分组: {critical_group_text(metadata.get('critical_groups', {}))}",
-        f"quote 成功: {compact_list(metadata.get('quote_success_tickers', []))}",
-        f"historical EOD 成功: {compact_list(metadata.get('historical_success_tickers', []))}",
     ]
+    if metadata.get("macro_degraded"):
+        lines.append(f"宏观降级: {metadata.get('macro_degraded_message')} 缺失 {compact_list(metadata.get('macro_degraded_tickers', []))}")
     if timed_out:
         lines.extend([
             f"未完成 ticker: {compact_list(metadata.get('unfinished_tickers', []))}",
@@ -380,6 +484,12 @@ def market_failure_status_message(market_data: dict[str, Any]) -> str:
     lines.append(f"是否需要升级/接入正式数据源: {'是' if needs_upgrade else '否'}")
     if needs_upgrade:
         lines.append(metadata.get("upgrade_message") or "免费行情源无法满足完整报告，需要接入/升级正式数据源。")
+    lines.extend([
+        "建议动作:",
+        "1. 等待下一次自动运行，避免在数据源限流时反复触发。",
+        "2. 手动运行 python -m src.warm_market_cache --config config.yaml 预热缓存。",
+        "3. 接入或升级 Finnhub / FMP / Twelve Data 等正式行情源。",
+    ])
     quote_only = metadata.get("quote_only_tickers", [])
     if quote_only:
         lines.append(f"quote 成功但历史指标暂缺: {compact_list(quote_only)}")
@@ -424,6 +534,8 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
     metadata = market_data.get("metadata", {})
     logger.info("数据获取结果: %s", market_fetch_summary(market_data))
     logger.info("缓存降级ticker: %s", compact_list(cache_ticker_details(market_data), limit=200))
+    logger.info("缓存日期集合: %s", compact_list(cache_dates(market_data), limit=200))
+    logger.info("质量阻断: %s", compact_list(metadata.get("quality_blockers", []), limit=200))
     logger.info("行情成功ticker: %s", compact_list(metadata.get("success_tickers", []), limit=200))
     logger.info("行情失败ticker: %s", compact_failed_details(metadata.get("failed_details", []), limit=200))
     logger.info("quote成功ticker: %s", compact_list(metadata.get("quote_success_tickers", []), limit=200))
