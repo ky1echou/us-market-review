@@ -21,7 +21,7 @@ EXPECTED_COMPANY_KEYWORDS: dict[str, list[str]] = {
     "AVGO": ["broadcom"],
 }
 
-VALIDATION_PROVIDERS = {"fmp", "twelve_data"}
+VALIDATION_PROVIDERS = {"fmp", "finnhub", "twelve_data"}
 
 
 @dataclass
@@ -50,6 +50,7 @@ def quote_metadata(quote: Any) -> dict[str, str]:
         or raw.get("shortName")
         or raw.get("longName")
         or raw.get("instrument_name")
+        or raw.get("description")
         or ""
     )
     exchange = raw.get("exchange") or raw.get("exchangeShortName") or raw.get("mic_code") or raw.get("exchange_timezone") or ""
@@ -88,26 +89,8 @@ def validate_one_symbol(ticker: str, provider_order: list[str], provider_options
             company_name = metadata["company_name"]
             provider_symbol = getattr(quote, "symbol", "") or ticker
             if company_name and not company_matches(ticker, company_name):
-                return SymbolValidationResult(
-                    ticker=ticker,
-                    ok=False,
-                    provider=getattr(provider, "name", normalized),
-                    provider_symbol=str(provider_symbol),
-                    company_name=company_name,
-                    exchange=metadata["exchange"],
-                    currency=metadata["currency"],
-                    failure_reason="symbol_mapping_error",
-                )
-            return SymbolValidationResult(
-                ticker=ticker,
-                ok=True,
-                provider=getattr(provider, "name", normalized),
-                provider_symbol=str(provider_symbol),
-                company_name=company_name,
-                exchange=metadata["exchange"],
-                currency=metadata["currency"],
-                failure_reason="" if company_name else "company_name_unavailable",
-            )
+                return SymbolValidationResult(ticker=ticker, ok=False, provider=getattr(provider, "name", normalized), provider_symbol=str(provider_symbol), company_name=company_name, exchange=metadata["exchange"], currency=metadata["currency"], failure_reason="symbol_mapping_error")
+            return SymbolValidationResult(ticker=ticker, ok=True, provider=getattr(provider, "name", normalized), provider_symbol=str(provider_symbol), company_name=company_name, exchange=metadata["exchange"], currency=metadata["currency"], failure_reason="" if company_name else "company_name_unavailable")
         except MarketProviderError as exc:
             last_error = exc.category
         except Exception as exc:  # noqa: BLE001
@@ -130,7 +113,10 @@ def validate_market_symbols(config: dict[str, Any], market_data: dict[str, Any])
         results.append(payload)
         asset = by_ticker.get(ticker)
         if asset is not None:
-            source = asset.setdefault("source", {}) if isinstance(asset.setdefault("source", {}), dict) else {}
+            source = asset.setdefault("source", {})
+            if not isinstance(source, dict):
+                source = {}
+                asset["source"] = source
             source.update(
                 {
                     "company_name": result.company_name,
@@ -155,17 +141,7 @@ def validate_market_symbols(config: dict[str, Any], market_data: dict[str, Any])
                 blockers.append(text)
         failed_details = metadata.setdefault("failed_details", [])
         for error in errors:
-            failed_details.append(
-                {
-                    "ticker": error.get("ticker"),
-                    "reason": "symbol_mapping_error",
-                    "quote_success": False,
-                    "historical_success": False,
-                    "provider": error.get("provider", ""),
-                    "provider_symbol": error.get("provider_symbol", ""),
-                    "company_name": error.get("company_name", ""),
-                }
-            )
+            failed_details.append({"ticker": error.get("ticker"), "reason": "symbol_mapping_error", "quote_success": False, "historical_success": False, "provider": error.get("provider", ""), "provider_symbol": error.get("provider_symbol", ""), "company_name": error.get("company_name", "")})
         metadata["formal_report_allowed"] = False
         metadata["needs_data_source_upgrade"] = True
         warnings = metadata.setdefault("warnings", [])
