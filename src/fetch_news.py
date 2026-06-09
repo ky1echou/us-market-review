@@ -15,141 +15,50 @@ from .fetch_market import load_config, now_iso
 
 
 AI_COMPANIES = {
-    "openai",
-    "anthropic",
-    "google",
-    "alphabet",
-    "gemini",
-    "deepmind",
-    "meta",
-    "microsoft",
-    "azure",
-    "nvidia",
-    "nvda",
-    "amd",
-    "broadcom",
-    "avgo",
-    "micron",
-    "mu",
-    "snowflake",
-    "servicenow",
-    "arm",
-    "marvell",
-    "mrvl",
+    "openai", "anthropic", "google", "alphabet", "gemini", "deepmind", "meta", "microsoft", "azure",
+    "amazon", "aws", "nvidia", "nvda", "amd", "broadcom", "avgo", "micron", "snowflake",
+    "servicenow", "arm", "marvell", "oracle", "palantir", "datadog", "crowdstrike", "mongodb",
 }
 AI_EXPLICIT_TERMS = {
-    "ai",
-    "artificial intelligence",
-    "generative ai",
-    "genai",
-    "large language model",
-    "llm",
-    "foundation model",
+    "ai", "artificial intelligence", "generative ai", "genai", "large language model", "llm", "foundation model",
 }
-AI_MODEL_TERMS = {
-    "chatbot",
-    "copilot",
-    "agent",
-    "agents",
-    "model training",
-    "inference",
-    "open-weight",
-    "multimodal",
-}
-AI_CHIP_TERMS = {
-    "ai chip",
-    "gpu",
-    "accelerator",
-    "hbm",
-    "asic",
-    "semiconductor",
-    "chip demand",
-    "advanced packaging",
-}
-AI_INFRA_TERMS = {
-    "data center",
-    "datacenter",
-    "cloud capex",
-    "capital expenditure",
-    "server rack",
-    "training cluster",
-    "power demand",
-    "liquid cooling",
-}
-AI_APP_TERMS = {
-    "ai application",
-    "enterprise ai",
-    "saas",
-    "automation",
-    "robotics",
-    "autonomous driving",
-    "self-driving",
-}
+AI_MODEL_TERMS = {"chatbot", "copilot", "agent", "agents", "model training", "inference", "open-weight", "multimodal"}
+AI_CHIP_TERMS = {"ai chip", "gpu", "accelerator", "hbm", "asic", "semiconductor", "chip demand", "advanced packaging"}
+AI_INFRA_TERMS = {"data center", "datacenter", "cloud capex", "capital expenditure", "server rack", "training cluster", "power demand", "liquid cooling"}
+AI_APP_TERMS = {"ai application", "enterprise ai", "saas", "automation", "robotics", "autonomous driving", "self-driving"}
 MACRO_TERMS = {
-    "fed",
-    "federal reserve",
-    "powell",
-    "fomc",
-    "rate cut",
-    "interest rate",
-    "treasury",
-    "yield",
-    "inflation",
-    "cpi",
-    "pce",
-    "payroll",
-    "jobs report",
-    "gdp",
-    "dollar",
-    "oil",
-    "crude",
-    "gold",
+    "fed", "federal reserve", "powell", "fomc", "rate cut", "interest rate", "treasury", "yield",
+    "inflation", "cpi", "pce", "payroll", "jobs report", "gdp", "dollar", "oil", "crude", "gold",
 }
-CHINA_TERMS = {
-    "china",
-    "beijing",
-    "hong kong",
-    "tariff",
-    "alibaba",
-    "baba",
-    "tencent",
-    "jd.com",
-    "jd",
-    "pdd",
-    "baidu",
-    "bidu",
-    "nio",
-    "xpeng",
-    "li auto",
-}
+CHINA_TERMS = {"china", "beijing", "hong kong", "tariff", "alibaba", "baba", "tencent", "jd.com", "pdd", "baidu", "bidu", "nio", "xpeng", "li auto"}
 GEOPOLITICS_TERMS = {
-    "ukraine",
-    "russia",
-    "israel",
-    "iran",
-    "gaza",
-    "red sea",
-    "sanction",
-    "geopolitical",
-    "war",
-    "ceasefire",
+    "ukraine", "russia", "israel", "iran", "gaza", "red sea", "sanction", "geopolitical", "war",
+    "ceasefire", "export control", "export controls", "chip curbs", "senate", "congress", "testify",
+    "hearing", "national security", "taiwan",
 }
-TICKER_ALIASES = {
+
+COMPANY_LEVEL_ALIASES = {
     "NVDA": {"nvidia", "nvda"},
-    "AMD": {"amd", "advanced micro devices"},
+    "AMD": {"advanced micro devices", "amd"},
     "AVGO": {"broadcom", "avgo"},
     "MSFT": {"microsoft", "msft", "azure"},
     "GOOGL": {"google", "alphabet", "googl", "gemini", "deepmind"},
-    "META": {"meta", "facebook"},
+    "META": {"meta platforms", "meta", "facebook", "instagram", "whatsapp"},
     "AMZN": {"amazon", "amzn", "aws"},
     "AAPL": {"apple", "aapl"},
     "TSLA": {"tesla", "tsla"},
-    "MU": {"micron", "mu"},
-    "MRVL": {"marvell", "mrvl"},
-    "ARM": {"arm"},
-    "SNOW": {"snowflake", "snow"},
-    "NOW": {"servicenow", "now"},
+    "MU": {"micron", "micron technology"},
+    "MRVL": {"marvell", "marvell technology"},
+    "ARM": {"arm holdings", "arm ltd", "arm"},
+    "SNOW": {"snowflake"},
+    "NOW": {"servicenow", "service now"},
+    "PLTR": {"palantir"},
+    "ORCL": {"oracle"},
+    "CRWD": {"crowdstrike"},
+    "DDOG": {"datadog"},
+    "MDB": {"mongodb"},
 }
+AMBIGUOUS_LOWERCASE_TICKERS = {"now", "snow", "arm", "mu"}
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -187,15 +96,38 @@ def phrase_present(normalized_text: str, term: str) -> bool:
     normalized_term = term.lower().strip()
     if not normalized_term:
         return False
+    if normalized_term in AMBIGUOUS_LOWERCASE_TICKERS:
+        return False
     if re.fullmatch(r"[a-z0-9.+-]+", normalized_term):
         pattern = rf"(?<![a-z0-9]){re.escape(normalized_term)}(?![a-z0-9])"
         return bool(re.search(pattern, normalized_text))
     return normalized_term in normalized_text
 
 
+def raw_ticker_present(raw_text: str, ticker: str) -> bool:
+    patterns = [rf"\${re.escape(ticker)}\b", rf"(?<![A-Z0-9]){re.escape(ticker)}(?![A-Z0-9])"]
+    return any(re.search(pattern, raw_text) for pattern in patterns)
+
+
 def term_hits(text: str, terms: set[str] | list[str]) -> list[str]:
     normalized = normalize_text(text)
     return [term for term in terms if phrase_present(normalized, term)]
+
+
+def company_ticker_hits(title: str, summary: str, config: dict[str, Any]) -> dict[str, list[str]]:
+    raw_text = f"{title} {summary}"
+    normalized = normalize_text(raw_text)
+    configured = {str(item.get("ticker", "")).upper() for item in config.get("market", {}).get("key_stocks", [])}
+    hits: dict[str, list[str]] = {}
+    for ticker, aliases in COMPANY_LEVEL_ALIASES.items():
+        if configured and ticker not in configured:
+            continue
+        matched = [alias for alias in aliases if phrase_present(normalized, alias)]
+        if raw_ticker_present(raw_text, ticker):
+            matched.append(ticker)
+        if matched:
+            hits[ticker] = sorted(set(matched))
+    return hits
 
 
 def ai_relevance(text: str) -> tuple[int, list[str]]:
@@ -214,63 +146,61 @@ def ai_relevance(text: str) -> tuple[int, list[str]]:
     if not qualified:
         return 0, []
 
-    score = 0
-    score += len(set(company_hits)) * 2
-    score += len(set(explicit_hits)) * 3
-    score += len(set(model_hits)) * 2
-    score += len(set(chip_hits)) * 2
-    score += len(set(infra_hits)) * 2
-    score += len(set(app_hits))
+    score = len(set(company_hits)) * 2 + len(set(explicit_hits)) * 3 + len(set(model_hits)) * 2
+    score += len(set(chip_hits)) * 2 + len(set(infra_hits)) * 2 + len(set(app_hits))
     if model_company_hits:
         score += 3
     if company_hits and topic_hits:
         score += 2
-    reasons = sorted(set(company_hits + topic_hits))
-    return score, reasons
+    return score, sorted(set(company_hits + topic_hits))
 
 
-def infer_tags(title: str, summary: str, config: dict[str, Any]) -> tuple[list[str], dict[str, int], dict[str, list[str]]]:
+def infer_tags(title: str, summary: str, config: dict[str, Any]) -> tuple[list[str], dict[str, int], dict[str, list[str]], list[str], list[str]]:
     text = f"{title} {summary}"
     tags: list[str] = []
+    levels: list[str] = []
     scores: dict[str, int] = {}
     reasons: dict[str, list[str]] = {}
+
+    company_hits = company_ticker_hits(title, summary, config)
+    if company_hits:
+        levels.append("公司级")
+        for ticker, matched in company_hits.items():
+            tags.append(ticker)
+            reasons[f"公司级:{ticker}"] = matched
 
     ai_score, ai_reasons = ai_relevance(text)
     if ai_score >= 5:
         tags.append("AI")
+        levels.append("产业级")
         scores["AI"] = ai_score
         reasons["AI"] = ai_reasons
 
     macro_hits = term_hits(text, MACRO_TERMS)
-    if len(set(macro_hits)) >= 1:
+    if macro_hits:
         tags.append("宏观")
+        levels.append("宏观级")
         scores["宏观"] = len(set(macro_hits))
         reasons["宏观"] = sorted(set(macro_hits))
 
     china_hits = term_hits(text, CHINA_TERMS)
-    if len(set(china_hits)) >= 1:
+    if china_hits:
         tags.append("中概/AH")
         scores["中概/AH"] = len(set(china_hits))
         reasons["中概/AH"] = sorted(set(china_hits))
 
     geopolitics_hits = term_hits(text, GEOPOLITICS_TERMS)
-    if len(set(geopolitics_hits)) >= 1:
+    if geopolitics_hits:
         tags.append("地缘")
+        levels.append("地缘级")
         scores["地缘"] = len(set(geopolitics_hits))
         reasons["地缘"] = sorted(set(geopolitics_hits))
 
-    normalized = normalize_text(text)
-    for stock in config.get("market", {}).get("key_stocks", []):
-        ticker = str(stock.get("ticker", "")).strip().upper()
-        aliases = set(TICKER_ALIASES.get(ticker, set()))
-        aliases.add(ticker.lower())
-        name = str(stock.get("name", "")).strip().lower()
-        if name:
-            aliases.add(name)
-        if any(phrase_present(normalized, alias) for alias in aliases):
-            tags.append(ticker)
-
-    return sorted(set(tags)), scores, reasons
+    if "中概/AH" in tags and "地缘级" not in levels:
+        levels.append("宏观级")
+    if not levels:
+        levels.append("未归类")
+    return sorted(set(tags)), scores, reasons, sorted(set(levels)), sorted(company_hits.keys())
 
 
 def fetch_feed(feed: dict[str, str], config: dict[str, Any], fetched_at: str) -> tuple[list[dict[str, Any]], str | None]:
@@ -293,7 +223,7 @@ def fetch_feed(feed: dict[str, str], config: dict[str, Any], fetched_at: str) ->
         summary = (entry.get("summary") or entry.get("description") or "").strip()
         published = entry_published_at(entry)
         published_at = published.isoformat() if published else None
-        tags, scores, reasons = infer_tags(title, summary, config)
+        tags, scores, reasons, levels, company_tickers = infer_tags(title, summary, config)
         items.append(
             {
                 "title": title,
@@ -304,6 +234,8 @@ def fetch_feed(feed: dict[str, str], config: dict[str, Any], fetched_at: str) ->
                 "published_at": published_at,
                 "fetched_at": fetched_at,
                 "tags": tags,
+                "classification": levels,
+                "company_tickers": company_tickers,
                 "topic_scores": scores,
                 "topic_reasons": reasons,
             }
@@ -339,14 +271,13 @@ def fetch_news(config: dict[str, Any]) -> dict[str, Any]:
             all_items.append(item)
 
     all_items.sort(key=lambda item: item.get("published_at") or "", reverse=True)
-
     return {
         "metadata": {
             "source": "Public RSS feeds",
             "lookback_hours": lookback_hours,
             "fetched_at": fetched_at,
             "timezone": timezone_name,
-            "tagging": "strict topical relevance scoring",
+            "tagging": "company-level strict match + industry/macro/geopolitical classification",
         },
         "items": all_items,
         "errors": errors,
