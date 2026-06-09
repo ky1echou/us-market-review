@@ -7,18 +7,53 @@ app:
   report_language: zh-CN
 
 market:
-  # 完整报告不做核心版/简版。数据源按顺序补齐完整股票池。
-  # Stooq 默认不进入生产链；如需手动测试，可把 provider_options.stooq.enabled 改为 true 或设置 ENABLE_STOOQ=true。
+  # 完整报告不做核心版/简版。数据源按路由补齐完整股票池，不通过删标的绕过失败。
   market_data_provider_order:
     - fmp
+    - finnhub
     - twelve_data
     - yfinance
     - cache
   provider_chain:
     - fmp
+    - finnhub
     - twelve_data
     - yfinance
     - cache
+
+  # 按标的路由，避免把 FMP 已知 402/权限不足的 ETF、SaaS、宏观资产反复优先请求到 FMP。
+  provider_routing:
+    default: [fmp, finnhub, twelve_data, yfinance, cache]
+    NVDA: [fmp, finnhub, twelve_data, yfinance, cache]
+    MSFT: [fmp, finnhub, twelve_data, yfinance, cache]
+    AAPL: [fmp, finnhub, twelve_data, yfinance, cache]
+    AMZN: [fmp, finnhub, twelve_data, yfinance, cache]
+    GOOGL: [fmp, finnhub, twelve_data, yfinance, cache]
+    META: [fmp, finnhub, twelve_data, yfinance, cache]
+    TSLA: [fmp, finnhub, twelve_data, yfinance, cache]
+    AMD: [fmp, finnhub, twelve_data, yfinance, cache]
+    QQQ: [finnhub, twelve_data, yfinance, cache]
+    DIA: [finnhub, twelve_data, yfinance, cache]
+    IWM: [finnhub, twelve_data, yfinance, cache]
+    SMH: [finnhub, twelve_data, yfinance, cache]
+    SOXX: [finnhub, twelve_data, yfinance, cache]
+    XLK: [finnhub, twelve_data, yfinance, cache]
+    XLF: [finnhub, twelve_data, yfinance, cache]
+    XLE: [finnhub, twelve_data, yfinance, cache]
+    XLV: [finnhub, twelve_data, yfinance, cache]
+    TLT: [finnhub, twelve_data, yfinance, cache]
+    GLD: [finnhub, twelve_data, yfinance, cache]
+    USO: [finnhub, twelve_data, yfinance, cache]
+    CPER: [finnhub, twelve_data, yfinance, cache]
+    AVGO: [finnhub, twelve_data, yfinance, cache]
+    MU: [finnhub, twelve_data, yfinance, cache]
+    MRVL: [finnhub, twelve_data, yfinance, cache]
+    ARM: [finnhub, twelve_data, yfinance, cache]
+    SNOW: [finnhub, twelve_data, yfinance, cache]
+    NOW: [finnhub, twelve_data, yfinance, cache]
+    US10Y: [twelve_data, finnhub, yfinance, cache]
+    DXY: [twelve_data, finnhub, yfinance, cache]
+    BTCUSD: [twelve_data, finnhub, yfinance, cache]
 
   provider_options:
     fmp:
@@ -45,20 +80,15 @@ market:
         US10Y: ^TNX
         DXY: DX-Y.NYB
         BTCUSD: BTCUSD
-        NVDA: NVDA
-        MSFT: MSFT
-        AAPL: AAPL
-        AMZN: AMZN
-        GOOGL: GOOGL
-        META: META
-        TSLA: TSLA
-        AMD: AMD
-        AVGO: AVGO
-        MU: MU
-        MRVL: MRVL
-        ARM: ARM
-        SNOW: SNOW
-        NOW: NOW
+    finnhub:
+      api_key_env: FINNHUB_API_KEY
+      base_url: https://finnhub.io/api/v1
+      timeout: 12
+      symbol_map:
+        VIX: ^VIX
+        US10Y: ^TNX
+        DXY: DXY
+        BTCUSD: BINANCE:BTCUSDT
     twelve_data:
       api_key_env: TWELVE_DATA_API_KEY
       base_url: https://api.twelvedata.com
@@ -89,20 +119,6 @@ market:
         US10Y: 10usy.b
         DXY: dx.f
         BTCUSD: btcusd
-        NVDA: nvda.us
-        MSFT: msft.us
-        AAPL: aapl.us
-        AMZN: amzn.us
-        GOOGL: googl.us
-        META: meta.us
-        TSLA: tsla.us
-        AMD: amd.us
-        AVGO: avgo.us
-        MU: mu.us
-        MRVL: mrvl.us
-        ARM: arm.us
-        SNOW: snow.us
-        NOW: now.us
     yfinance:
       symbol_map:
         VIX: ^VIX
@@ -115,6 +131,7 @@ market:
       api_key_env: POLYGON_API_KEY
 
   period: 90d
+  warm_cache_period: 90d
   provider_check_period: 30d
   interval: 1d
   request_delay_sec: 0.5
@@ -129,11 +146,14 @@ market:
 
   cache_dir: data/processed/market_cache
   cache_snapshot_path: data/processed/market_cache.json
+  latest_data_path: data/processed/latest_market_data.json
+  latest_snapshot_max_age_minutes: 720
   cache_max_age_hours: 168
   cache_max_trading_days: 3
 
-  # 完整股票池可用率低于 90%，不生成正式 Markdown/PDF，只推送状态提示。
   min_success_ratio: 0.9
+  live_min_success_ratio: 0.7
+  cache_max_success_ratio: 0.3
   critical_groups:
     index_etf:
       min_success_ratio: 1.0
@@ -208,55 +228,46 @@ ah_mapping:
     theme: AI算力
     mapping_strength: 强映射
     a_h_mapping: 光模块、PCB、服务器、液冷、算力租赁、半导体设备
-    watch_points: 关注美股AI芯片与半导体ETF对A股算力链情绪映射
   - us_ticker: AMD
     us_name: AMD
     theme: AI芯片
     mapping_strength: 强映射
     a_h_mapping: GPU产业链、先进封装、服务器
-    watch_points: 关注AI芯片竞争格局和数据中心需求
   - us_ticker: AVGO
     us_name: 博通
     theme: AI网络/ASIC
     mapping_strength: 强映射
     a_h_mapping: 交换机、光通信、ASIC、PCB
-    watch_points: 关注AI网络和定制芯片需求
   - us_ticker: MU
     us_name: 美光
     theme: AI存储/HBM
     mapping_strength: 强映射
     a_h_mapping: 存储、HBM、半导体材料设备
-    watch_points: 关注AI服务器存储需求对存储链映射
   - us_ticker: MRVL
     us_name: Marvell
     theme: AI网络/ASIC
     mapping_strength: 强映射
     a_h_mapping: 光通信、交换芯片、ASIC、PCB
-    watch_points: 关注AI网络链弹性
   - us_ticker: MSFT
     us_name: 微软
     theme: 云与AI应用
     mapping_strength: 弱映射
     a_h_mapping: 云计算、软件、AI应用、数据中心
-    watch_points: 关注云资本开支和AI商业化
   - us_ticker: GOOGL
     us_name: Alphabet
     theme: AI应用/云
     mapping_strength: 弱映射
     a_h_mapping: AI应用、云计算、广告科技
-    watch_points: 关注云增长与AI应用竞争
   - us_ticker: META
     us_name: Meta
     theme: AI广告/大模型
     mapping_strength: 弱映射
     a_h_mapping: AI应用、广告科技、港股互联网情绪
-    watch_points: 关注AI广告和开源大模型催化
   - us_ticker: TSLA
     us_name: 特斯拉
     theme: 电动车/机器人
     mapping_strength: 情绪映射
     a_h_mapping: 汽车零部件、机器人、智能驾驶、锂电
-    watch_points: 关注交付、价格、FSD与机器人催化
 
 report:
   title: 中文美股复盘报告
