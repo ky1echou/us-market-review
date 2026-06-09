@@ -11,6 +11,16 @@ on:
         required: false
         type: boolean
         default: false
+      refresh_market_data:
+        description: "Refresh latest market data without generating the formal report"
+        required: false
+        type: boolean
+        default: false
+      warm_cache:
+        description: "Warm local market cache slowly after deployment"
+        required: false
+        type: boolean
+        default: false
       run_provider_universe_check:
         description: "Run the full live provider universe check after deployment"
         required: false
@@ -52,16 +62,21 @@ jobs:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${FMP_API_KEY:-}" ]; then
             echo "::warning::FMP_API_KEY secret is empty or not configured; deployment will keep the existing server .env value if present."
           fi
+          if [ -z "${FINNHUB_API_KEY:-}" ]; then
+            echo "::warning::FINNHUB_API_KEY secret is empty or not configured; Finnhub routing will be skipped unless the server .env already has it."
+          fi
           if [ -z "${TWELVE_DATA_API_KEY:-}" ]; then
             echo "::warning::TWELVE_DATA_API_KEY secret is empty or not configured; Twelve Data fallback will be skipped unless the server .env already has it."
           fi
           FMP_API_KEY_B64="$(printf '%s' "${FMP_API_KEY:-}" | base64 -w 0)"
+          FINNHUB_API_KEY_B64="$(printf '%s' "${FINNHUB_API_KEY:-}" | base64 -w 0)"
           TWELVE_DATA_API_KEY_B64="$(printf '%s' "${TWELVE_DATA_API_KEY:-}" | base64 -w 0)"
 
           ssh \
@@ -69,7 +84,7 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=20 \
             -o TCPKeepAlive=yes \
-            "${SERVER_USER}@${SERVER_HOST}" "FMP_API_KEY_B64='${FMP_API_KEY_B64}' TWELVE_DATA_API_KEY_B64='${TWELVE_DATA_API_KEY_B64}' bash -s" <<'REMOTE'
+            "${SERVER_USER}@${SERVER_HOST}" "FMP_API_KEY_B64='${FMP_API_KEY_B64}' FINNHUB_API_KEY_B64='${FINNHUB_API_KEY_B64}' TWELVE_DATA_API_KEY_B64='${TWELVE_DATA_API_KEY_B64}' bash -s" <<'REMOTE'
           set -euo pipefail
 
           cd /opt/us-market-review
@@ -111,10 +126,11 @@ jobs:
           }
 
           upsert_env_secret "FMP_API_KEY" "${FMP_API_KEY_B64:-}"
+          upsert_env_secret "FINNHUB_API_KEY" "${FINNHUB_API_KEY_B64:-}"
           upsert_env_secret "TWELVE_DATA_API_KEY" "${TWELVE_DATA_API_KEY_B64:-}"
-          unset FMP_API_KEY_B64 TWELVE_DATA_API_KEY_B64
+          unset FMP_API_KEY_B64 FINNHUB_API_KEY_B64 TWELVE_DATA_API_KEY_B64
 
-          for key_name in FMP_API_KEY TWELVE_DATA_API_KEY; do
+          for key_name in FMP_API_KEY FINNHUB_API_KEY TWELVE_DATA_API_KEY; do
             if grep -q "^${key_name}=" .env; then
               key_len="$(awk -F= -v name="${key_name}" 'index($0, name "=") == 1 { print length(substr($0, index($0,"=")+1)); exit }' .env)"
               if [ "${key_len:-0}" -gt 0 ]; then
@@ -159,6 +175,49 @@ jobs:
           tail -n 160 logs/provider_check.log || true
           echo "Recent server log:"
           tail -n 80 logs/daily.log || true
+          REMOTE
+
+      - name: Refresh market data manually
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.refresh_market_data == 'true' }}
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/us-market-review-deploy-key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o TCPKeepAlive=yes \
+            "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/us-market-review
+          PYTHON_BIN=".venv/bin/python"
+          [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
+          "$PYTHON_BIN" -m src.refresh_market_data --config config.yaml
+          "$PYTHON_BIN" -m src.data_quality_check --config config.yaml
+          tail -n 120 logs/provider_check.log || true
+          REMOTE
+
+      - name: Warm market cache manually
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.warm_cache == 'true' }}
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/us-market-review-deploy-key \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=20 \
+            -o TCPKeepAlive=yes \
+            "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/us-market-review
+          PYTHON_BIN=".venv/bin/python"
+          [ -x "$PYTHON_BIN" ] || PYTHON_BIN="python3"
+          "$PYTHON_BIN" -m src.warm_market_cache --config config.yaml
+          tail -n 120 logs/provider_check.log || true
           REMOTE
 
       - name: Full live universe provider check manually
@@ -220,7 +279,7 @@ jobs:
           echo "Recent server log:"
           tail -n 120 logs/daily.log || true
 
-          if grep -E "PDF 生成失败|行情数据抓取失败或不足|运行超时|行情质量警告" logs/daily.log | tail -n 20; then
+          if grep -E "PDF 生成失败|行情数据抓取失败或不足|运行超时|行情/质量警告|正式报告质量门槛" logs/daily.log | tail -n 20; then
             echo "::warning::Report run finished with warnings. Check logs/daily.log on the server."
           fi
 
