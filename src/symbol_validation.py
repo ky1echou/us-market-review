@@ -54,11 +54,7 @@ def quote_metadata(quote: Any) -> dict[str, str]:
     )
     exchange = raw.get("exchange") or raw.get("exchangeShortName") or raw.get("mic_code") or raw.get("exchange_timezone") or ""
     currency = raw.get("currency") or raw.get("currency_name") or raw.get("currency_base") or ""
-    return {
-        "company_name": str(company_name or ""),
-        "exchange": str(exchange or ""),
-        "currency": str(currency or ""),
-    }
+    return {"company_name": str(company_name or ""), "exchange": str(exchange or ""), "currency": str(currency or "")}
 
 
 def company_matches(ticker: str, company_name: str) -> bool:
@@ -67,7 +63,7 @@ def company_matches(ticker: str, company_name: str) -> bool:
         return True
     normalized = normalize_company_name(company_name)
     if not normalized:
-        return False
+        return True
     return any(keyword in normalized for keyword in expected)
 
 
@@ -91,7 +87,7 @@ def validate_one_symbol(ticker: str, provider_order: list[str], provider_options
             metadata = quote_metadata(quote)
             company_name = metadata["company_name"]
             provider_symbol = getattr(quote, "symbol", "") or ticker
-            if not company_matches(ticker, company_name):
+            if company_name and not company_matches(ticker, company_name):
                 return SymbolValidationResult(
                     ticker=ticker,
                     ok=False,
@@ -110,6 +106,7 @@ def validate_one_symbol(ticker: str, provider_order: list[str], provider_options
                 company_name=company_name,
                 exchange=metadata["exchange"],
                 currency=metadata["currency"],
+                failure_reason="" if company_name else "company_name_unavailable",
             )
         except MarketProviderError as exc:
             last_error = exc.category
