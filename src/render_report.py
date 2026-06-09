@@ -14,10 +14,11 @@ from zoneinfo import ZoneInfo
 import markdown as markdown_lib
 from dotenv import load_dotenv
 
-from .fetch_market import fetch_market_data, load_config
+from .fetch_market import fetch_market_data, load_config, trading_days_since
 from .fetch_news import fetch_news
 from .prompt_builder import build_markdown_report
 from .send_report import PushResult, send_outputs, send_telegram_message, telegram_enabled
+from .symbol_validation import validate_market_symbols
 
 
 MARKET_FAILURE_MESSAGE = "今日行情数据抓取失败或不足，未生成正式美股复盘，请检查数据源。"
@@ -26,6 +27,7 @@ REPORT_QUALITY_FAILURE_MESSAGE = "正式报告生成质量校验失败，未发�
 FORBIDDEN_REPORT_TERMS = [
     "Too Many Requests",
     "HTTP 402",
+    "HTTP 429",
     "no cache fallback available",
     "attempt 1/",
     "attempt 1 of",
@@ -92,25 +94,33 @@ def markdown_to_html(markdown_text: str, title: str) -> str:
   <meta charset="utf-8">
   <title>{escaped_title}</title>
   <style>
-    @page {{ size: A4; margin: 12mm; }}
+    @page {{ size: A4 landscape; margin: 10mm; }}
     html, body {{ margin: 0; padding: 0; }}
     body {{
       font-family: "WenQuanYi Zen Hei", "WenQuanYi Micro Hei", "Noto Sans CJK SC",
         "Noto Sans CJK", "DejaVu Sans", "Microsoft YaHei", Arial, sans-serif;
-      font-size: 12px;
-      line-height: 1.58;
+      font-size: 11px;
+      line-height: 1.52;
       color: #17202a;
       background: #ffffff;
     }}
-    h1 {{ font-size: 24px; margin: 0 0 14px; color: #0f172a; }}
-    h2 {{ font-size: 18px; margin: 22px 0 10px; color: #111827; page-break-after: avoid; }}
-    h3 {{ font-size: 14px; margin: 16px 0 8px; color: #1f2937; page-break-after: avoid; }}
-    p, li {{ word-break: break-word; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 10px 0 16px; font-size: 10px; page-break-inside: auto; }}
+    h1 {{ font-size: 23px; margin: 0 0 12px; color: #0f172a; }}
+    h2 {{ font-size: 17px; margin: 20px 0 9px; color: #111827; page-break-after: avoid; }}
+    h3 {{ font-size: 13px; margin: 14px 0 7px; color: #1f2937; page-break-after: avoid; }}
+    p, li {{ word-break: normal; overflow-wrap: anywhere; }}
+    table {{ border-collapse: collapse; width: 100%; margin: 9px 0 15px; font-size: 9px; page-break-inside: auto; table-layout: fixed; }}
     thead {{ display: table-header-group; }}
     tr {{ page-break-inside: avoid; page-break-after: auto; }}
-    th, td {{ border: 1px solid #d8dee9; padding: 5px 6px; vertical-align: top; word-break: break-word; }}
+    th, td {{ border: 1px solid #d8dee9; padding: 4px 5px; vertical-align: top; overflow-wrap: anywhere; word-break: normal; }}
     th {{ background: #f3f6f9; font-weight: 700; }}
+    th:nth-child(1), td:nth-child(1) {{ width: 15%; }}
+    th:nth-child(2), td:nth-child(2) {{ width: 12%; }}
+    th:nth-child(3), td:nth-child(3),
+    th:nth-child(4), td:nth-child(4),
+    th:nth-child(5), td:nth-child(5),
+    th:nth-child(6), td:nth-child(6) {{ width: 7%; white-space: nowrap; text-align: right; }}
+    th:nth-child(7), td:nth-child(7) {{ width: 11%; }}
+    th:nth-child(8), td:nth-child(8) {{ width: 28%; }}
     code, pre {{ white-space: pre-wrap; word-break: break-word; }}
     a {{ color: #1d4ed8; text-decoration: none; }}
   </style>
@@ -147,7 +157,20 @@ def render_pdf_with_wkhtmltopdf(html_path: Path, pdf_path: Path, config: dict[st
     executable = wkhtmltopdf_path(config)
     if not executable:
         return False, "未找到 wkhtmltopdf"
-    command = [executable, "--encoding", "utf-8", "--enable-local-file-access", "--print-media-type", "--page-size", "A4", "--margin-top", "12mm", "--margin-bottom", "12mm", "--margin-left", "12mm", "--margin-right", "12mm", str(html_path.resolve()), str(pdf_path.resolve())]
+    command = [
+        executable,
+        "--encoding", "utf-8",
+        "--enable-local-file-access",
+        "--print-media-type",
+        "--page-size", "A4",
+        "--orientation", "Landscape",
+        "--margin-top", "10mm",
+        "--margin-bottom", "10mm",
+        "--margin-left", "10mm",
+        "--margin-right", "10mm",
+        str(html_path.resolve()),
+        str(pdf_path.resolve()),
+    ]
     completed = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
@@ -165,7 +188,7 @@ def render_pdf_with_playwright(html_path: Path, pdf_path: Path) -> tuple[bool, s
             browser = playwright.chromium.launch(args=["--no-sandbox"])
             page = browser.new_page()
             page.goto(html_path.resolve().as_uri(), wait_until="networkidle")
-            page.pdf(path=str(pdf_path.resolve()), format="A4", print_background=True, margin={"top": "12mm", "bottom": "12mm", "left": "12mm", "right": "12mm"})
+            page.pdf(path=str(pdf_path.resolve()), format="A4", landscape=True, print_background=True, margin={"top": "10mm", "bottom": "10mm", "left": "10mm", "right": "10mm"})
             browser.close()
         return True, "Playwright/Chromium 转换完成"
     except Exception as exc:  # noqa: BLE001
@@ -250,7 +273,8 @@ def compact_failed_details(details: list[dict[str, Any]], limit: int = 30) -> st
         reason = item.get("reason") or "quote_failed"
         quote = "Q✓" if item.get("quote_success") else "Q×"
         hist = "H✓" if item.get("historical_success") else "H×"
-        items.append(f"{ticker}({reason},{quote},{hist})")
+        company = f",{item.get('company_name')}" if item.get("company_name") else ""
+        items.append(f"{ticker}({reason},{quote},{hist}{company})")
     return compact_list(items, limit=limit)
 
 
@@ -263,6 +287,59 @@ def critical_group_text(groups: dict[str, Any]) -> str:
         status = "通过" if item.get("passed") else f"失败: {compact_list(failed)}"
         parts.append(f"{name}={status}")
     return "；".join(parts)
+
+
+def cache_ticker_details(market_data: dict[str, Any]) -> list[str]:
+    details = []
+    for asset in market_data.get("assets", []):
+        source = asset.get("source", {}) if isinstance(asset.get("source"), dict) else {}
+        if asset.get("from_cache") or source.get("from_cache"):
+            details.append(f"{asset.get('ticker')}({asset.get('as_of') or source.get('as_of') or '日期暂缺'})")
+    return details
+
+
+def parse_asset_date(value: Any):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except ValueError:
+        return None
+
+
+def enforce_cache_freshness(market_data: dict[str, Any], max_trading_days: int = 3) -> list[str]:
+    blockers: list[str] = []
+    for asset in market_data.get("assets", []):
+        source = asset.get("source", {}) if isinstance(asset.get("source"), dict) else {}
+        if not (asset.get("from_cache") or source.get("from_cache")):
+            continue
+        as_of_date = parse_asset_date(asset.get("as_of") or source.get("as_of"))
+        if not as_of_date or trading_days_since(as_of_date) > max_trading_days:
+            blockers.append(f"cache_stale: {asset.get('ticker')} as_of={asset.get('as_of') or source.get('as_of') or 'unknown'}")
+    return blockers
+
+
+def apply_quality_gates(config: dict[str, Any], market_data: dict[str, Any], logger: logging.Logger) -> None:
+    metadata = market_data.setdefault("metadata", {})
+    validation = validate_market_symbols(config, market_data)
+    for item in validation.get("checked", []):
+        logger.info(
+            "symbol校验: ticker=%s ok=%s provider=%s symbol=%s company=%s exchange=%s currency=%s reason=%s",
+            item.get("ticker"), item.get("ok"), item.get("provider"), item.get("provider_symbol"),
+            item.get("company_name"), item.get("exchange"), item.get("currency"), item.get("failure_reason"),
+        )
+    blockers = metadata.setdefault("quality_blockers", [])
+    for blocker in enforce_cache_freshness(market_data, 3):
+        if blocker not in blockers:
+            blockers.append(blocker)
+    if blockers:
+        metadata["formal_report_allowed"] = False
+        metadata["needs_data_source_upgrade"] = True
+        warnings = metadata.setdefault("warnings", [])
+        warning = "正式报告质量门槛未通过：存在过期缓存或 symbol/company_name 校验问题。"
+        if warning not in warnings:
+            warnings.append(warning)
+        logger.error("正式报告质量门槛未通过: %s", " | ".join(blockers))
 
 
 def market_failure_status_message(market_data: dict[str, Any]) -> str:
@@ -283,10 +360,12 @@ def market_failure_status_message(market_data: dict[str, Any]) -> str:
         f"行情成功率: {success_ratio:.1f}%（正式报告门槛 {min_ratio:.1f}%）",
         f"实时获取数量: {live_success}",
         f"缓存降级数量: {cache_success}",
+        f"缓存降级 ticker: {compact_list(cache_ticker_details(market_data))}",
         f"数据源: {metadata.get('source') or '未披露'}",
         f"获取时间: {metadata.get('fetched_at') or '未披露'}",
         f"成功 ticker: {compact_list(metadata.get('success_tickers', []))}",
         f"失败 ticker: {compact_failed_details(metadata.get('failed_details', []))}",
+        f"质量阻断: {compact_list(metadata.get('quality_blockers', []))}",
         f"关键分组: {critical_group_text(metadata.get('critical_groups', {}))}",
         f"quote 成功: {compact_list(metadata.get('quote_success_tickers', []))}",
         f"historical EOD 成功: {compact_list(metadata.get('historical_success_tickers', []))}",
@@ -316,6 +395,8 @@ def send_market_failure_alert(market_data: dict[str, Any]) -> list[PushResult]:
 
 def formal_report_allowed(market_data: dict[str, Any]) -> bool:
     metadata = market_data.get("metadata", {})
+    if metadata.get("quality_blockers"):
+        return False
     total = int(metadata.get("total_count") or 0)
     explicit_flag = metadata.get("formal_report_allowed")
     if explicit_flag is not None:
@@ -339,8 +420,10 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
     config = load_config(config_path)
     logger.info("配置文件: %s", config_path)
     market_data = fetch_market_data(config)
+    apply_quality_gates(config, market_data, logger)
     metadata = market_data.get("metadata", {})
     logger.info("数据获取结果: %s", market_fetch_summary(market_data))
+    logger.info("缓存降级ticker: %s", compact_list(cache_ticker_details(market_data), limit=200))
     logger.info("行情成功ticker: %s", compact_list(metadata.get("success_tickers", []), limit=200))
     logger.info("行情失败ticker: %s", compact_failed_details(metadata.get("failed_details", []), limit=200))
     logger.info("quote成功ticker: %s", compact_list(metadata.get("quote_success_tickers", []), limit=200))
@@ -349,19 +432,25 @@ def run(config_path: str | Path, logger: logging.Logger | None = None) -> tuple[
     if metadata.get("market_fetch_timed_out"):
         logger.error("失败原因: market_fetch_timeout provider=%s ticker=%s last_error=%s", metadata.get("current_provider"), metadata.get("current_ticker"), metadata.get("last_error"))
     for warning in metadata.get("warnings", []):
-        logger.warning("行情质量警告: %s", warning)
+        logger.warning("行情/质量警告: %s", warning)
     for asset in market_data.get("assets", []):
+        source = asset.get("source", {}) if isinstance(asset.get("source"), dict) else {}
+        logger.info(
+            "行情明细: ticker=%s from_cache=%s provider=%s as_of=%s company=%s exchange=%s currency=%s failure_reason=%s",
+            asset.get("ticker"), asset.get("from_cache"), source.get("provider"), asset.get("as_of") or source.get("as_of"),
+            source.get("company_name"), source.get("exchange"), source.get("currency"), asset.get("failure_reason"),
+        )
         if asset.get("error"):
-            logger.warning("行情失败或降级: ticker=%s from_cache=%s provider=%s failure_reason=%s reason=%s", asset.get("ticker"), asset.get("from_cache"), asset.get("source", {}).get("provider"), asset.get("failure_reason"), asset.get("error"))
+            logger.warning("行情失败或降级: ticker=%s from_cache=%s provider=%s failure_reason=%s reason=%s", asset.get("ticker"), asset.get("from_cache"), source.get("provider"), asset.get("failure_reason"), asset.get("error"))
         elif asset.get("indicator_reason"):
-            logger.info("行情quote可用但指标暂缺: ticker=%s provider=%s reason=%s", asset.get("ticker"), asset.get("source", {}).get("provider"), asset.get("indicator_reason"))
+            logger.info("行情quote可用但指标暂缺: ticker=%s provider=%s reason=%s", asset.get("ticker"), source.get("provider"), asset.get("indicator_reason"))
 
     if not formal_report_allowed(market_data):
         message = market_failure_status_message(market_data)
         logger.error("失败原因: %s", message.replace("\n", " | "))
         push_results = send_market_failure_alert(market_data)
         log_push_results(logger, push_results)
-        logger.info("运行结束: market_data_failed_no_formal_report")
+        logger.info("运行结束: market_or_quality_failed_no_formal_report")
         return None, None, [message], push_results
 
     news_data = fetch_news(config)
