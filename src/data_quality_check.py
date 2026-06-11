@@ -39,6 +39,7 @@ def run(config_path: str, input_path: str | None = None) -> dict[str, Any]:
         f"success={success}/{total} "
         f"live={live} cache={cache} failed={failed} "
         f"formal_report_allowed={metadata.get('formal_report_allowed')} "
+        f"macro_proxy={compact(metadata.get('macro_proxy_tickers', []))} "
         f"failed_tickers={compact(metadata.get('failed_tickers', []))}"
     )
     return market_data
