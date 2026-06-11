@@ -51,8 +51,9 @@ market:
     ARM: [finnhub, twelve_data, yfinance, cache]
     SNOW: [finnhub, twelve_data, yfinance, cache]
     NOW: [finnhub, twelve_data, yfinance, cache]
-    US10Y: [twelve_data, finnhub, yfinance, cache]
-    DXY: [twelve_data, finnhub, yfinance, cache]
+    US10Y: [twelve_data, finnhub, tlt_proxy, cache]
+    DXY: [twelve_data, finnhub, uup_proxy, cache]
+    UUP: [finnhub, twelve_data, cache]
     BTCUSD: [twelve_data, finnhub, yfinance, cache]
 
   provider_options:
@@ -88,6 +89,7 @@ market:
         VIX: ^VIX
         US10Y: ^TNX
         DXY: DXY
+        UUP: UUP
         BTCUSD: BINANCE:BTCUSDT
     twelve_data:
       api_key_env: TWELVE_DATA_API_KEY
@@ -97,7 +99,18 @@ market:
         VIX: VIX
         US10Y: TNX
         DXY: DXY
+        UUP: UUP
         BTCUSD: BTC/USD
+    tlt_proxy:
+      enabled: false
+      proxy_ticker: TLT
+      implemented_by: src.macro_proxy.apply_macro_proxies
+      note: 10Y美债收益率数据暂缺，使用TLT观察长端利率方向。
+    uup_proxy:
+      enabled: false
+      proxy_ticker: UUP
+      implemented_by: src.macro_proxy.apply_macro_proxies
+      note: 美元指数数据暂缺，使用UUP观察美元方向。
     stooq:
       enabled: false
       symbol_map:
@@ -115,6 +128,7 @@ market:
         GLD: gld.us
         USO: uso.us
         CPER: cper.us
+        UUP: uup.us
         VIX: ^vix
         US10Y: 10usy.b
         DXY: dx.f
@@ -124,6 +138,7 @@ market:
         VIX: ^VIX
         US10Y: ^TNX
         DXY: DX-Y.NYB
+        UUP: UUP
         BTCUSD: BTC-USD
     alpha_vantage:
       api_key_env: ALPHA_VANTAGE_API_KEY
@@ -199,6 +214,7 @@ market:
   macro_assets:
     - {ticker: US10Y, name: 10Y美债收益率, theme: 利率, required: true}
     - {ticker: DXY, name: 美元指数, theme: 美元, required: true}
+    - {ticker: UUP, name: 美元指数ETF(UUP代理), theme: 美元/代理, required: false}
     - {ticker: TLT, name: 长债ETF, theme: 利率/久期, required: true}
     - {ticker: GLD, name: 黄金ETF, theme: 黄金, required: true}
     - {ticker: USO, name: 原油ETF, theme: 原油, required: true}
